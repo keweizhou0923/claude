@@ -15,6 +15,7 @@ from sklearn.model_selection import KFold
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
+from sklearn.metrics import roc_auc_score
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -88,7 +89,10 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
         cum_accts = np.arange(1, len(sub) + 1) / len(sub)
         cum_co    = sub["charge_off"].cumsum() / sub["charge_off"].sum()
 
-        gini = round(2 * float(np.trapezoid(cum_co, cum_accts)) - 1, 3)
+        # Gini = 2 * ROC_AUC - 1.
+        # The CAP (Lorenz) curve AUC ≠ ROC AUC at non-50% bad rates, so we
+        # compute ROC AUC directly: high score = low risk → negate for roc_auc_score.
+        gini = round(2 * roc_auc_score(sub["charge_off"], -sub[model]) - 1, 3)
         ax.plot(cum_accts, cum_co,
                 linestyle=line_styles[i], color=colors[i], linewidth=1.8,
                 label=f"{model}  (Gini = {gini:.3f})")
@@ -215,7 +219,7 @@ def plot_cmi_table(cmi_df: pd.DataFrame) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5):
     sub    = df[[m1, m2, "charge_off"]].dropna().copy()
-    labels = list(range(n_buckets, 0, -1))   # 5=safest tier label, 1=riskiest
+    labels = list(range(n_buckets, 0, -1))   # label 1=safest (highest score), label 5=riskiest (lowest score)
 
     sub[f"{m1}_tier"], cuts_m1 = pd.qcut(sub[m1], q=n_buckets, labels=labels,
                                           retbins=True, duplicates="drop")
@@ -235,7 +239,8 @@ def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5):
 # 6. TIER ASSIGNMENT  —  exhaustive search, 1.5x weighted-average CO rule
 # ──────────────────────────────────────────────────────────────────────────────
 def _weighted_co(cells: pd.DataFrame) -> float:
-    return cells["ChargeOffs"].sum() / cells["N"].sum()
+    total_n = cells["N"].sum()
+    return cells["ChargeOffs"].sum() / total_n if total_n > 0 else 0.0
 
 def _find_best_split(cells, n_tiers, mult):
     nc = len(cells)
