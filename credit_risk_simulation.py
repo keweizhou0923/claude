@@ -2,35 +2,53 @@
 Credit Risk Score Pipeline — v2
 ================================
 Changes from v1:
-  - Pair selection: Conditional Mutual Information (CMI) + k-fold CV
-    replaces logistic regression blending on training data
-  - Tier assignment: exhaustive search for 1.5x weighted-average CO rate rule
-    replaces hardcoded combined-score bins
+  - Overall CO rate adjusted to ~25%
+  - Pair selection: CMI + k-fold CV
+  - Tier assignment: 1.5x weighted-average CO rate rule
+  - Outputs: Lorenz curves, CMI table, coloured score grid with annotations
 """
 
 import numpy as np
 import pandas as pd
 from itertools import combinations
 from sklearn.model_selection import KFold
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
 import warnings
 warnings.filterwarnings("ignore")
 
+plt.rcParams.update({"figure.dpi": 150, "font.size": 9})
+
 np.random.seed(42)
 
-N        = 50_000   # accounts
-N_BINS   = 5        # quintile bins for CMI discretisation
-N_FOLDS  = 5        # k-fold CV folds
-MULT     = 1.5      # minimum tier-over-tier CO rate multiplier
-N_TIERS  = 5        # number of risk tiers
+N       = 50_000
+N_BINS  = 5
+N_FOLDS = 5
+MULT    = 1.5
+N_TIERS = 5
+
+TIER_ORDER = ["Low Risk", "Medium-Low", "Medium", "Medium-High", "High Risk"]
+TIER_PALETTE = {
+    "Low Risk":    "#2ecc71",
+    "Medium-Low":  "#a8e063",
+    "Medium":      "#f9c74f",
+    "Medium-High": "#f76c1b",
+    "High Risk":   "#e03131",
+}
+MODELS = ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. SIMULATE DATASET
+# 1. SIMULATE DATASET  —  target overall CO rate ≈ 25 %
 # ──────────────────────────────────────────────────────────────────────────────
 def simulate_dataset(n: int) -> pd.DataFrame:
     latent = np.random.normal(0, 1, n)
-    prob   = 1 / (1 + np.exp(-(1.5 * latent - 0.5)))
-    co     = np.random.binomial(1, prob, n)
+
+    # intercept = -1.5  →  sigmoid(-1.5) ≈ 0.182 at latent=0, but because
+    # E[sigmoid(1.5Z - 1.5)] with Z~N(0,1) integrates to ~25 % via probit approx
+    prob = 1 / (1 + np.exp(-(1.5 * latent - 1.5)))
+    co   = np.random.binomial(1, prob, n)
 
     def score(signal, noise):
         raw  = -signal * latent + np.random.normal(0, noise, n)
@@ -46,103 +64,97 @@ def simulate_dataset(n: int) -> pd.DataFrame:
         "Model_D": score(1.1, 1.6),   # weak
         "Model_E": score(0.4, 2.2),   # near-noise
     })
-    for col in ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]:
+    for col in MODELS:
         df.loc[np.random.rand(n) < 0.05, col] = np.nan
     return df
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2. CONDITIONAL MUTUAL INFORMATION
-#
-# Theory recap:
-#   I(Y ; B | A) = H(Y | A) - H(Y | A, B)
-#
-#   H(Y | A)    = Σ_a  p(a)   · H(Y | A=a)       [entropy of Y within each A-bin]
-#   H(Y | A, B) = Σ_ab p(a,b) · H(Y | A=a, B=b)  [entropy of Y within each cell]
-#
-# We use the SYMMETRIC version:  CMI = [ I(Y;B|A) + I(Y;A|B) ] / 2
-# so neither model is privileged as "primary".
-#
-# Bins are fit on the TRAINING fold and applied to the TEST fold
-# to get an honest out-of-sample CMI estimate.
+# 2. LORENZ CURVES
+#    X-axis : cumulative % of accounts, sorted riskiest first (score ascending)
+#    Y-axis : cumulative % of charge-offs captured
+#    Gini   : 2·AUC - 1  (area between Lorenz curve and the diagonal)
+# ──────────────────────────────────────────────────────────────────────────────
+def plot_lorenz_curves(df: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    line_styles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+    colors      = ["#2c7bb6", "#d7191c", "#1a9641", "#fdae61", "#9e4fb5"]
+
+    for i, model in enumerate(MODELS):
+        sub = df[["charge_off", model]].dropna()
+        sub = sub.sort_values(model, ascending=True).reset_index(drop=True)
+
+        cum_accts = np.arange(1, len(sub) + 1) / len(sub)
+        cum_co    = sub["charge_off"].cumsum() / sub["charge_off"].sum()
+
+        gini = round(2 * float(np.trapezoid(cum_co, cum_accts)) - 1, 3)
+        ax.plot(cum_accts, cum_co,
+                linestyle=line_styles[i], color=colors[i], linewidth=1.8,
+                label=f"{model}  (Gini = {gini:.3f})")
+
+    # Random-model diagonal
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random model")
+
+    ax.fill_between([0, 1], [0, 1], [0, 1], alpha=0)   # invisible — keeps layout clean
+    ax.set_xlabel("Cumulative % of Accounts  (sorted riskiest → safest)")
+    ax.set_ylabel("Cumulative % of Charge-Offs Captured")
+    ax.set_title("Lorenz Curves — Model Comparison", fontsize=12, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=9)
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+    plt.savefig("lorenz_curves.png", bbox_inches="tight")
+    plt.close()
+    print("    Saved: lorenz_curves.png")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. CMI FUNCTIONS  (unchanged from v1)
 # ──────────────────────────────────────────────────────────────────────────────
 def _h(p: float) -> float:
-    """Binary entropy H(p) in bits. Returns 0 for p ∈ {0, 1}."""
     if p <= 0.0 or p >= 1.0:
         return 0.0
     return -p * np.log2(p) - (1.0 - p) * np.log2(1.0 - p)
 
-
-def _make_cuts(scores: np.ndarray, n_bins: int) -> np.ndarray:
-    """Fit equal-population bin edges; extend to (-∞, +∞) for test-fold coverage."""
+def _make_cuts(scores, n_bins):
     _, cuts = pd.qcut(scores, q=n_bins, retbins=True, duplicates="drop")
     cuts[0], cuts[-1] = -np.inf, np.inf
     return cuts
 
-
-def _apply_cuts(scores: np.ndarray, cuts: np.ndarray) -> np.ndarray:
+def _apply_cuts(scores, cuts):
     return np.array(pd.cut(scores, bins=cuts, labels=False), dtype=float)
 
-
-def _h_y_given_a(y: np.ndarray, a_bins: np.ndarray) -> float:
-    """H(Y | A) — weighted average binary entropy within each A-bin."""
+def _h_y_given_a(y, a_bins):
     n, h = len(y), 0.0
-    for a_val in np.unique(a_bins[~np.isnan(a_bins)]):
-        mask = a_bins == a_val
-        h += mask.sum() / n * _h(y[mask].mean())
+    for av in np.unique(a_bins[~np.isnan(a_bins)]):
+        m = a_bins == av
+        h += m.sum() / n * _h(y[m].mean())
     return h
 
-
-def _h_y_given_ab(y: np.ndarray, a_bins: np.ndarray, b_bins: np.ndarray) -> float:
-    """H(Y | A, B) — weighted average binary entropy within each (A, B) cell."""
+def _h_y_given_ab(y, a_bins, b_bins):
     n = len(y)
-    df_t = pd.DataFrame({"y": y, "a": a_bins, "b": b_bins}).dropna()
-    h = 0.0
-    for (_, grp) in df_t.groupby(["a", "b"]):
+    dt = pd.DataFrame({"y": y, "a": a_bins, "b": b_bins}).dropna()
+    h  = 0.0
+    for _, grp in dt.groupby(["a", "b"]):
         h += len(grp) / n * _h(grp["y"].mean())
     return h
 
-
-def _cmi_one_direction(y, primary_bins, secondary_bins):
-    """I(Y ; secondary | primary) = H(Y|primary) - H(Y|primary, secondary)."""
-    return max(0.0, _h_y_given_a(y, primary_bins) - _h_y_given_ab(y, primary_bins, secondary_bins))
-
+def _cmi_dir(y, pb, sb):
+    return max(0.0, _h_y_given_a(y, pb) - _h_y_given_ab(y, pb, sb))
 
 def compute_cmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
-    """
-    5-fold CV CMI.
-
-    For each fold:
-      1. Fit quintile cuts on the training split (80 % of data).
-      2. Apply those cuts to the held-out test split (20 %).
-      3. Compute symmetric CMI on the test split only.
-
-    Reporting:
-      CMI_mean  — average across folds (primary ranking metric)
-      CMI_std   — fold-to-fold variability (stability check)
-      CMI_min   — worst fold (conservative lower bound)
-    """
     sub = df[[m1, m2, "charge_off"]].dropna().reset_index(drop=True)
     y, sa, sb = sub["charge_off"].values, sub[m1].values, sub[m2].values
-
-    kf   = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
-    vals = []
-
-    for tr_idx, te_idx in kf.split(y):
-        # Fit bins on training fold
-        cuts_a = _make_cuts(sa[tr_idx], N_BINS)
-        cuts_b = _make_cuts(sb[tr_idx], N_BINS)
-
-        # Apply to test fold
-        a_bins = _apply_cuts(sa[te_idx], cuts_a)
-        b_bins = _apply_cuts(sb[te_idx], cuts_b)
-        y_te   = y[te_idx]
-
-        # Symmetric: average both directions
-        cmi = (_cmi_one_direction(y_te, a_bins, b_bins) +
-               _cmi_one_direction(y_te, b_bins, a_bins)) / 2
-        vals.append(cmi)
-
+    kf, vals = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42), []
+    for tr, te in kf.split(y):
+        ca, cb = _make_cuts(sa[tr], N_BINS), _make_cuts(sb[tr], N_BINS)
+        ab, bb = _apply_cuts(sa[te], ca), _apply_cuts(sb[te], cb)
+        vals.append((_cmi_dir(y[te], ab, bb) + _cmi_dir(y[te], bb, ab)) / 2)
     return {
         "Pair":     f"{m1} + {m2}",
         "N_valid":  len(sub),
@@ -153,117 +165,136 @@ def compute_cmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. SCORE GRID — 5 × 5 QUINTILE BINS
+# 4. CMI TABLE  —  matplotlib figure of the ranked pair table
 # ──────────────────────────────────────────────────────────────────────────────
-def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5) -> pd.DataFrame:
+def plot_cmi_table(cmi_df: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.axis("off")
+
+    display = cmi_df[["Pair", "N_valid", "CMI_mean", "CMI_std", "CMI_min"]].copy()
+    display.columns = ["Model Pair", "N Valid", "CMI Mean (bits)", "CMI Std", "CMI Min (bits)"]
+    display["Rank"] = range(1, len(display) + 1)
+    display = display[["Rank", "Model Pair", "N Valid", "CMI Mean (bits)", "CMI Std", "CMI Min (bits)"]]
+
+    tbl = ax.table(
+        cellText=display.values,
+        colLabels=display.columns,
+        cellLoc="center",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.6)
+
+    # Header styling
+    for j in range(len(display.columns)):
+        tbl[0, j].set_facecolor("#2c3e50")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+
+    # Highlight best pair (rank 1)
+    for j in range(len(display.columns)):
+        tbl[1, j].set_facecolor("#d5f5e3")
+        tbl[1, j].set_text_props(fontweight="bold")
+
+    # Alternating row shading
+    for i in range(2, len(display) + 1):
+        clr = "#f8f9fa" if i % 2 == 0 else "white"
+        for j in range(len(display.columns)):
+            tbl[i, j].set_facecolor(clr)
+
+    ax.set_title("CMI Pair Ranking  (5-fold CV · Symmetric · sorted by CMI Mean)",
+                 fontsize=11, fontweight="bold", pad=12)
+    plt.tight_layout()
+    plt.savefig("cmi_table.png", bbox_inches="tight")
+    plt.close()
+    print("    Saved: cmi_table.png")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. SCORE GRID  —  5 × 5 quintile bins; returns grid + cut points
+# ──────────────────────────────────────────────────────────────────────────────
+def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5):
     sub    = df[[m1, m2, "charge_off"]].dropna().copy()
-    labels = list(range(n_buckets, 0, -1))   # 5 = safest, 1 = riskiest
-    sub[f"{m1}_tier"] = pd.qcut(sub[m1], q=n_buckets, labels=labels, duplicates="drop")
-    sub[f"{m2}_tier"] = pd.qcut(sub[m2], q=n_buckets, labels=labels, duplicates="drop")
+    labels = list(range(n_buckets, 0, -1))   # 5=safest tier label, 1=riskiest
+
+    sub[f"{m1}_tier"], cuts_m1 = pd.qcut(sub[m1], q=n_buckets, labels=labels,
+                                          retbins=True, duplicates="drop")
+    sub[f"{m2}_tier"], cuts_m2 = pd.qcut(sub[m2], q=n_buckets, labels=labels,
+                                          retbins=True, duplicates="drop")
+
     grid = (
         sub.groupby([f"{m1}_tier", f"{m2}_tier"], observed=True)
         .agg(N=("charge_off", "count"), ChargeOffs=("charge_off", "sum"))
         .reset_index()
     )
     grid["CO_Rate"] = (grid["ChargeOffs"] / grid["N"]).round(4)
-    return grid
+    return grid, cuts_m1, cuts_m2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. TIER ASSIGNMENT — 1.5x WEIGHTED-AVERAGE CO RATE RULE
-#
-# Algorithm:
-#   1. Sort all 25 cells by CO rate ascending (lowest risk first).
-#   2. Enumerate every way to split the sorted list into N_TIERS contiguous
-#      blocks — C(n_cells - 1, N_TIERS - 1) = C(24, 4) = 10,626 combinations.
-#   3. For each candidate partition compute the weighted-average CO rate
-#      per tier (accounts-weighted).
-#   4. Keep only partitions where every consecutive tier pair satisfies
-#      avg_CO(Tier k+1) >= MULT × avg_CO(Tier k).
-#   5. Among valid partitions, pick the one that maximises the minimum
-#      achieved multiplier (most conservative / most separated).
+# 6. TIER ASSIGNMENT  —  exhaustive search, 1.5x weighted-average CO rule
 # ──────────────────────────────────────────────────────────────────────────────
 def _weighted_co(cells: pd.DataFrame) -> float:
     return cells["ChargeOffs"].sum() / cells["N"].sum()
 
-
-def _find_best_split(cells: pd.DataFrame, n_tiers: int, mult: float):
-    """
-    Exhaustive search. Returns boundary list [0, s1, s2, s3, s4, n_cells]
-    or None if no valid partition exists.
-    """
+def _find_best_split(cells, n_tiers, mult):
     nc = len(cells)
     best_bounds, best_min_mult = None, -1.0
-
     for splits in combinations(range(1, nc), n_tiers - 1):
         bounds = (0,) + splits + (nc,)
-        rates  = [_weighted_co(cells.iloc[bounds[i]:bounds[i + 1]])
-                  for i in range(n_tiers)]
-
-        # Skip if any non-last tier has zero CO rate (can't compute ratio)
+        rates  = [_weighted_co(cells.iloc[bounds[i]:bounds[i+1]]) for i in range(n_tiers)]
         if any(r == 0.0 for r in rates[:-1]):
             continue
-
-        mults = [rates[i + 1] / rates[i] for i in range(n_tiers - 1)]
+        mults = [rates[i+1] / rates[i] for i in range(n_tiers - 1)]
         if all(m >= mult for m in mults):
             min_m = min(mults)
             if min_m > best_min_mult:
-                best_min_mult = min_m
-                best_bounds   = bounds
-
+                best_min_mult, best_bounds = min_m, bounds
     return best_bounds
 
-
 def assign_tiers(grid: pd.DataFrame, n_tiers: int = N_TIERS,
-                 mult: float = MULT) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Assign each of the 25 score-grid cells to a named risk tier
-    using the 1.5x weighted-average CO rate rule.
-
-    Returns
-    -------
-    grid_tiered : original grid with 'Risk_Tier' column added
-    summary     : one row per tier with CO rate, multiplier, coverage
-    """
-    # Drop cells with no accounts or NaN CO rate before partitioning
-    cells = (grid.dropna(subset=["CO_Rate"])
-                 .sort_values("CO_Rate", ascending=True)
-                 .reset_index(drop=True))
+                 mult: float = MULT) -> tuple:
+    # Sort cells by CO rate; preserve original index for merge-back
+    cells = grid.dropna(subset=["CO_Rate"]).copy()
+    cells["_orig_idx"] = cells.index
+    cells = cells.sort_values("CO_Rate", ascending=True).reset_index(drop=True)
 
     bounds = _find_best_split(cells, n_tiers, mult)
-
     if bounds is None:
-        print(f"  WARNING: No partition satisfies {mult}x rule with {n_tiers} tiers.")
-        print(f"           Falling back to equal-count split.")
+        print(f"  WARNING: No {mult}x partition found — falling back to equal-count split.")
         nc     = len(cells)
         chunk  = nc // n_tiers
         bounds = tuple([i * chunk for i in range(n_tiers)] + [nc])
 
-    tier_names = ["Low Risk", "Medium-Low", "Medium", "Medium-High", "High Risk"]
-
-    # Assign tier label to each cell
-    tier_col = np.empty(len(cells), dtype=object)
-    summary_rows = []
+    tier_col, summary_rows, co_cuts = np.empty(len(cells), dtype=object), [], []
     for i in range(n_tiers):
-        grp  = cells.iloc[bounds[i]:bounds[i + 1]]
-        name = tier_names[i]
-        tier_col[bounds[i]:bounds[i + 1]] = name
+        grp  = cells.iloc[bounds[i]:bounds[i+1]]
+        name = TIER_ORDER[i]
+        tier_col[bounds[i]:bounds[i+1]] = name
+        rate = _weighted_co(grp)
         summary_rows.append({
             "Risk_Tier":   name,
             "N_Cells":     len(grp),
             "Accounts":    int(grp["N"].sum()),
             "ChargeOffs":  int(grp["ChargeOffs"].sum()),
-            "Avg_CO_Rate": round(_weighted_co(grp), 4),
+            "Avg_CO_Rate": round(rate, 4),
+            "CO_Rate_Min": round(grp["CO_Rate"].min(), 4),
+            "CO_Rate_Max": round(grp["CO_Rate"].max(), 4),
         })
+        co_cuts.append(round(grp["CO_Rate"].max(), 4))   # upper CO boundary of tier
 
-    cells = cells.copy()
     cells["Risk_Tier"] = tier_col
 
-    # Build summary with multipliers and coverage
+    # Merge tier labels back onto original grid via preserved index
+    tier_map            = cells.set_index("_orig_idx")["Risk_Tier"]
+    grid_tiered         = grid.copy()
+    grid_tiered["Risk_Tier"] = tier_map.reindex(grid_tiered.index).values
+
+    # Build summary
     summary = pd.DataFrame(summary_rows)
     rates   = summary["Avg_CO_Rate"].values
     summary["Multiplier_vs_Prev"] = ["-"] + [
-        f"{rates[i] / rates[i - 1]:.2f}x" for i in range(1, n_tiers)
+        f"{rates[i] / rates[i-1]:.2f}x" for i in range(1, n_tiers)
     ]
     summary["CO_Rate_Pct"]    = (summary["Avg_CO_Rate"] * 100).round(1).astype(str) + "%"
     total_co                  = summary["ChargeOffs"].sum()
@@ -271,99 +302,233 @@ def assign_tiers(grid: pd.DataFrame, n_tiers: int = N_TIERS,
         (summary["ChargeOffs"] / total_co * 100).round(1).astype(str) + "%"
     )
 
-    # Merge tier label back onto the original grid (preserving all 25 rows)
-    tier_map   = cells[["CO_Rate", "Risk_Tier"]].drop_duplicates("CO_Rate")
-    grid_tiered = grid.merge(tier_map, on="CO_Rate", how="left")
-
-    return grid_tiered, summary
+    return grid_tiered, summary, co_cuts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. MAIN PIPELINE
+# 7. SCORE GRID CHART
+#    Coloured 5×5 heatmap — each cell annotated with N / #CO / CO%
+#    Axes labelled with actual score cut points
+#    Right panel shows CO-rate cut points per risk tier
+# ──────────────────────────────────────────────────────────────────────────────
+def _score_range_label(tier_label: int, cuts: np.ndarray) -> str:
+    """
+    Map a tier label (1-5, where 1=safest/highest score) to its score range.
+    cuts from pd.qcut are in ascending order: [min, q20, q40, q60, q80, max].
+    Tier label 1 → top quintile → cuts[4]–cuts[5]
+    Tier label 5 → bottom quintile → cuts[0]–cuts[1]
+    """
+    idx  = 5 - int(tier_label)       # tier 1 → idx 4, tier 5 → idx 0
+    lo   = cuts[idx]
+    hi   = cuts[idx + 1]
+    lo_s = f"{int(lo)}" if lo != -np.inf else f"{int(cuts[1]-1)}"
+    hi_s = f"{int(hi)}" if hi != np.inf  else f"{int(cuts[-2]+1)}"
+    return f"{lo_s}–{hi_s}"
+
+
+def plot_score_grid(grid_tiered: pd.DataFrame, m1: str, m2: str,
+                    cuts_m1: np.ndarray, cuts_m2: np.ndarray,
+                    summary: pd.DataFrame, co_cuts: list) -> None:
+
+    m1c, m2c = f"{m1}_tier", f"{m2}_tier"
+
+    # ── layout: grid on left, tier legend on right ────────────────────────────
+    fig = plt.figure(figsize=(13, 7))
+    gs  = fig.add_gridspec(1, 2, width_ratios=[3, 1.1], wspace=0.35)
+    ax  = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1])
+    ax2.axis("off")
+
+    tier_labels_int = [1, 2, 3, 4, 5]   # tier 1=safest, 5=riskiest
+
+    # ── draw cells ────────────────────────────────────────────────────────────
+    for _, row in grid_tiered.iterrows():
+        m1_t  = int(row[m1c])
+        m2_t  = int(row[m2c])
+        tier  = row.get("Risk_Tier")
+        color = TIER_PALETTE.get(tier, "#cccccc")
+
+        # grid coordinates: x = m2_tier-1, y = m1_tier-1 (both 0-based)
+        x, y = m2_t - 1, m1_t - 1
+
+        rect = plt.Rectangle((x, y), 1, 1, facecolor=color, edgecolor="white",
+                              linewidth=2, zorder=1)
+        ax.add_patch(rect)
+
+        # cell annotations
+        n_acc = int(row["N"])
+        n_co  = int(row["ChargeOffs"])
+        co_r  = row["CO_Rate"]
+
+        ax.text(x + 0.5, y + 0.72, f"N = {n_acc:,}",
+                ha="center", va="center", fontsize=7.5, color="black", zorder=2)
+        ax.text(x + 0.5, y + 0.48, f"CO = {n_co:,}",
+                ha="center", va="center", fontsize=7.5, color="black", zorder=2)
+        ax.text(x + 0.5, y + 0.24, f"{co_r:.1%}",
+                ha="center", va="center", fontsize=9,
+                fontweight="bold", color="black", zorder=2)
+
+    # ── axes: score cut points as tick labels ─────────────────────────────────
+    ax.set_xlim(0, 5)
+    ax.set_ylim(0, 5)
+
+    x_labels = [_score_range_label(t, cuts_m2) for t in tier_labels_int]
+    y_labels = [_score_range_label(t, cuts_m1) for t in tier_labels_int]
+
+    ax.set_xticks([i + 0.5 for i in range(5)])
+    ax.set_xticklabels(
+        [f"Tier {t}\n({x_labels[i]})" for i, t in enumerate(tier_labels_int)],
+        fontsize=8
+    )
+    ax.set_yticks([i + 0.5 for i in range(5)])
+    ax.set_yticklabels(
+        [f"Tier {t}\n({y_labels[i]})" for i, t in enumerate(tier_labels_int)],
+        fontsize=8
+    )
+
+    ax.set_xlabel(f"{m2} Score  →  Tier 1 = Safest, Tier 5 = Riskiest", fontsize=10)
+    ax.set_ylabel(f"{m1} Score  →  Tier 1 = Safest, Tier 5 = Riskiest", fontsize=10)
+    ax.set_title(f"Score Grid: {m1} × {m2}\n(volume · charge-offs · CO%  |  coloured by risk tier)",
+                 fontsize=11, fontweight="bold")
+
+    # ── right panel: tier legend + CO cut points ───────────────────────────────
+    ax2.set_title("Risk Tier Key\n& CO Rate Cut Points",
+                  fontsize=10, fontweight="bold", pad=8)
+
+    y_pos = 0.97
+    for idx, tier in enumerate(TIER_ORDER):
+        row_s = summary[summary["Risk_Tier"] == tier]
+        if row_s.empty:
+            continue
+        row_s = row_s.iloc[0]
+
+        # Coloured patch + tier name
+        patch = mpatches.FancyBboxPatch(
+            (0.02, y_pos - 0.07), 0.96, 0.07,
+            boxstyle="round,pad=0.01",
+            facecolor=TIER_PALETTE[tier], edgecolor="white", linewidth=1.5,
+            transform=ax2.transAxes, zorder=2
+        )
+        ax2.add_patch(patch)
+        ax2.text(0.50, y_pos - 0.035, tier,
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=9, fontweight="bold", color="black", zorder=3)
+
+        # Stats below patch
+        co_lo = f"{row_s['CO_Rate_Min']:.1%}"
+        co_hi = f"{row_s['CO_Rate_Max']:.1%}"
+        mult_str = row_s["Multiplier_vs_Prev"]
+        ax2.text(0.50, y_pos - 0.115,
+                 f"CO range: {co_lo} – {co_hi}",
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=7.8, color="#333333")
+        ax2.text(0.50, y_pos - 0.155,
+                 f"Avg CO: {row_s['CO_Rate_Pct']}  |  {mult_str}",
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=7.5, color="#555555")
+        ax2.text(0.50, y_pos - 0.195,
+                 f"{row_s['Accounts']:,} accts  ·  {row_s['Pct_of_All_COs']} of COs",
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=7.5, color="#555555")
+
+        y_pos -= 0.22
+
+    # CO rate cut-point dividers between tiers (skip last)
+    y_pos2 = 0.97
+    for idx in range(len(TIER_ORDER) - 1):
+        cutoff = co_cuts[idx]
+        ax2.text(0.50, y_pos2 - 0.22 * (idx + 1) + 0.01,
+                 f"── CO cut: {cutoff:.1%} ──",
+                 transform=ax2.transAxes, ha="center", va="center",
+                 fontsize=7, color="#888888", style="italic")
+
+    plt.savefig("score_grid_chart.png", bbox_inches="tight")
+    plt.close()
+    print("    Saved: score_grid_chart.png")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. MAIN PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     sep = "=" * 70
     print(sep)
     print("  CREDIT RISK SCORE PIPELINE — v2")
-    print("  Pair Selection : CMI + Cross-Validation")
-    print("  Tier Assignment: 1.5x Weighted-Average CO Rate Rule")
     print(sep)
 
-    # ── Simulate ──────────────────────────────────────────────────────────────
-    print(f"\n[1] Simulating {N:,} accounts …")
+    # ── simulate ──────────────────────────────────────────────────────────────
+    print(f"\n[1] Simulating {N:,} accounts (target CO ≈ 25%) …")
     df = simulate_dataset(N)
-    print(f"    Overall Charge-Off Rate : {df['charge_off'].mean():.2%}")
+    actual_co = df["charge_off"].mean()
+    print(f"    Actual Charge-Off Rate : {actual_co:.2%}")
 
-    # ── CMI pair ranking ──────────────────────────────────────────────────────
-    print(f"\n[2] CMI Pair Selection ({N_FOLDS}-fold CV, {N_BINS} quintile bins per score)")
-    print(f"    Symmetric CMI = [ I(Y;B|A) + I(Y;A|B) ] / 2  (units: bits)")
+    # ── Lorenz curves ──────────────────────────────────────────────────────────
+    print("\n[2] Lorenz Curves")
+    plot_lorenz_curves(df)
+
+    # ── CMI pair selection ────────────────────────────────────────────────────
+    print(f"\n[3] CMI Pair Selection ({N_FOLDS}-fold CV)")
     print("-" * 70)
-
-    models   = ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]
-    cmi_rows = [compute_cmi_cv(df, m1, m2) for m1, m2 in combinations(models, 2)]
+    cmi_rows = [compute_cmi_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
     cmi_df   = (pd.DataFrame(cmi_rows)
                   .sort_values("CMI_mean", ascending=False)
                   .reset_index(drop=True))
 
     print(cmi_df.to_string(index=False))
     cmi_df.to_csv("pair_cmi_rankings.csv", index=False)
+    plot_cmi_table(cmi_df)
 
     best    = cmi_df.iloc[0]
     best_m1, best_m2 = [m.strip() for m in best["Pair"].split("+")]
     print(f"\n  ★  Best pair : {best['Pair']}")
     print(f"     CMI mean   = {best['CMI_mean']:.6f} bits")
-    print(f"     CMI min    = {best['CMI_min']:.6f} bits  (worst fold — conservative bound)")
-    print(f"     CMI std    = {best['CMI_std']:.6f} bits  (fold stability)")
+    print(f"     CMI min    = {best['CMI_min']:.6f} bits")
 
-    # ── Score grid ────────────────────────────────────────────────────────────
-    print(f"\n[3] 5×5 Score Grid  —  {best['Pair']}")
-    print("    (Tier 5 = Safest, Tier 1 = Riskiest)")
-    print("-" * 70)
-    grid = build_score_grid(df, best_m1, best_m2)
+    # ── score grid ────────────────────────────────────────────────────────────
+    print(f"\n[4] Building 5×5 Score Grid — {best['Pair']}")
+    grid, cuts_m1, cuts_m2 = build_score_grid(df, best_m1, best_m2)
     grid.to_csv("score_grid_raw.csv", index=False)
 
     m1c, m2c = f"{best_m1}_tier", f"{best_m2}_tier"
-    pivot_co  = grid.pivot_table(index=m1c, columns=m2c, values="CO_Rate", aggfunc="mean")
+    pivot_co  = grid.pivot_table(index=m1c, columns=m2c,
+                                  values="CO_Rate", aggfunc="mean")
     pivot_co.index.name = f"{best_m1} ↓ / {best_m2} →"
-    print("\nCharge-Off Rate per cell:")
+    print("\nCharge-Off Rate per cell (Tier 1=Safest, Tier 5=Riskiest):")
     print(pivot_co.round(3).to_string())
 
-    # ── 1.5x tier assignment ──────────────────────────────────────────────────
-    print(f"\n[4] Tier Assignment  —  {MULT}x Weighted-Average CO Rate Rule")
-    print(f"    Exhaustive search over C(n_cells-1, {N_TIERS}-1) split points")
+    # ── tier assignment ───────────────────────────────────────────────────────
+    print(f"\n[5] Tier Assignment — {MULT}x CO Rate Rule")
     print("-" * 70)
-    grid_tiered, summary = assign_tiers(grid)
+    grid_tiered, summary, co_cuts = assign_tiers(grid)
     grid_tiered.to_csv("score_grid_tiered.csv", index=False)
     summary.to_csv("risk_tier_summary.csv", index=False)
 
-    # Tier summary table
-    print("\nRisk Tier Summary:")
     display_cols = ["Risk_Tier", "N_Cells", "Accounts", "CO_Rate_Pct",
-                    "Multiplier_vs_Prev", "Pct_of_All_COs"]
+                    "CO_Rate_Min", "CO_Rate_Max", "Multiplier_vs_Prev",
+                    "Pct_of_All_COs"]
+    print("\nRisk Tier Summary:")
     print(summary[display_cols].to_string(index=False))
 
-    # Multiplier validation
     print("\nMultiplier validation (must be ≥ 1.50x):")
     rates = summary["Avg_CO_Rate"].values
     for i in range(1, N_TIERS):
         ratio  = rates[i] / rates[i - 1]
-        status = "✓" if ratio >= MULT else "✗  <-- FAILS constraint"
-        print(f"  {summary['Risk_Tier'].iloc[i-1]:12s} → {summary['Risk_Tier'].iloc[i]:12s} : "
-              f"{rates[i-1]:.1%} → {rates[i]:.1%}   ({ratio:.2f}x)  {status}")
+        status = "✓" if ratio >= MULT else "✗  FAILS"
+        print(f"  {summary['Risk_Tier'].iloc[i-1]:12s} → "
+              f"{summary['Risk_Tier'].iloc[i]:12s} : "
+              f"{rates[i-1]:.1%} → {rates[i]:.1%}  ({ratio:.2f}x)  {status}")
 
-    # Tier map on the grid
-    if "Risk_Tier" in grid_tiered.columns:
-        pivot_tier = grid_tiered.pivot_table(
-            index=m1c, columns=m2c, values="Risk_Tier", aggfunc="first"
-        )
-        pivot_tier.index.name = f"{best_m1} ↓ / {best_m2} →"
-        print(f"\nRisk Tier per cell:")
-        print(pivot_tier.to_string())
+    # ── score grid chart ───────────────────────────────────────────────────────
+    print(f"\n[6] Score Grid Chart")
+    plot_score_grid(grid_tiered, best_m1, best_m2,
+                    cuts_m1, cuts_m2, summary, co_cuts)
 
-    # ── Output files ──────────────────────────────────────────────────────────
-    print("\n[5] Files written:")
-    for f in ["pair_cmi_rankings.csv", "score_grid_raw.csv",
-              "score_grid_tiered.csv", "risk_tier_summary.csv"]:
+    # ── output summary ─────────────────────────────────────────────────────────
+    print("\n[7] Files written:")
+    for f in ["lorenz_curves.png", "cmi_table.png",
+              "pair_cmi_rankings.csv", "score_grid_raw.csv",
+              "score_grid_tiered.csv", "risk_tier_summary.csv",
+              "score_grid_chart.png"]:
         print(f"    {f}")
 
     print("\n" + sep)

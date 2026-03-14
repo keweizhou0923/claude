@@ -1,6 +1,6 @@
-Risk_Tier,N_Cells,Accounts,ChargeOffs,Avg_CO_Rate,Multiplier_vs_Prev,CO_Rate_Pct,Pct_of_All_COs
-Low Risk,3,6112,514,0.0841,-,8.4%,2.7%
-Medium-Low,3,4721,661,0.14,1.66x,14.0%,3.5%
-Medium,5,8917,2287,0.2565,1.83x,25.6%,12.2%
-Medium-High,5,8820,3741,0.4241,1.65x,42.4%,20.0%
-High Risk,9,16568,11521,0.6954,1.64x,69.5%,61.5%
+Risk_Tier,N_Cells,Accounts,ChargeOffs,Avg_CO_Rate,CO_Rate_Min,CO_Rate_Max,Multiplier_vs_Prev,CO_Rate_Pct,Pct_of_All_COs
+Low Risk,2,3011,88,0.0292,0.0284,0.0304,-,2.9%,0.8%
+Medium-Low,6,11577,720,0.0622,0.0338,0.0933,2.13x,6.2%,6.3%
+Medium,3,5162,668,0.1294,0.1009,0.1835,2.08x,12.9%,5.8%
+Medium-High,9,16264,4384,0.2696,0.1897,0.3378,2.08x,27.0%,38.1%
+High Risk,5,9124,5636,0.6177,0.6042,0.6359,2.29x,61.8%,49.0%
