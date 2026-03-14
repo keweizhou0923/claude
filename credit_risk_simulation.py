@@ -1,310 +1,377 @@
 """
-Credit Risk Score Simulation & Model Comparison
-================================================
-Simulates a credit portfolio dataset with:
-  - Binary charge-off label (target)
-  - 5 model scores (Model_A … Model_E) with varying predictive power
-
-Then ranks every single model and every pair of models by:
-  - AUC-ROC
-  - KS Statistic (Kolmogorov-Smirnov)
-  - Gini Coefficient
-  - Top-decile Capture Rate (% of charge-offs caught in riskiest 10%)
-
-The best two-model pair is used to build a combined score grid
-showing Charge-Off Rate by Credit Risk Tier.
+Credit Risk Score Pipeline — v2
+================================
+Changes from v1:
+  - Pair selection: Conditional Mutual Information (CMI) + k-fold CV
+    replaces logistic regression blending on training data
+  - Tier assignment: exhaustive search for 1.5x weighted-average CO rate rule
+    replaces hardcoded combined-score bins
 """
 
 import numpy as np
 import pandas as pd
 from itertools import combinations
-from sklearn.metrics import roc_auc_score, roc_curve
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
 import warnings
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
-# 1. SIMULATE DATASET
-# ─────────────────────────────────────────────
 np.random.seed(42)
-N = 50_000  # accounts
 
+N        = 50_000   # accounts
+N_BINS   = 5        # quintile bins for CMI discretisation
+N_FOLDS  = 5        # k-fold CV folds
+MULT     = 1.5      # minimum tier-over-tier CO rate multiplier
+N_TIERS  = 5        # number of risk tiers
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. SIMULATE DATASET
+# ──────────────────────────────────────────────────────────────────────────────
 def simulate_dataset(n: int) -> pd.DataFrame:
-    """
-    Simulate a credit portfolio with a charge-off flag and 5 model scores.
+    latent = np.random.normal(0, 1, n)
+    prob   = 1 / (1 + np.exp(-(1.5 * latent - 0.5)))
+    co     = np.random.binomial(1, prob, n)
 
-    Scores are calibrated to reflect realistic predictive power differences:
-      Model_A – Strong (AUC ~0.78)   internal bureau model
-      Model_B – Strong (AUC ~0.75)   external vendor model
-      Model_C – Moderate (AUC ~0.68) behavioural score
-      Model_D – Weak    (AUC ~0.62)  thin-file proxy score
-      Model_E – Noise   (AUC ~0.53)  experimental model
-    """
-    # Latent credit risk factor (higher → worse risk)
-    latent_risk = np.random.normal(0, 1, n)
-
-    # Charge-off probability driven by latent risk
-    charge_off_prob = 1 / (1 + np.exp(-(1.5 * latent_risk - 0.5)))
-    charge_off = np.random.binomial(1, charge_off_prob, n)
-
-    # Model scores: scaled 300-850 (like a bureau score, higher = lower risk)
-    def make_score(latent, signal_strength, noise_sd, score_min=300, score_max=850):
-        raw = -signal_strength * latent + np.random.normal(0, noise_sd, n)
-        # Normalise to [score_min, score_max]
-        raw_norm = (raw - raw.min()) / (raw.max() - raw.min())
-        return np.round(score_min + raw_norm * (score_max - score_min)).astype(int)
+    def score(signal, noise):
+        raw  = -signal * latent + np.random.normal(0, noise, n)
+        norm = (raw - raw.min()) / (raw.max() - raw.min())
+        return np.round(300 + norm * 550).astype(int)
 
     df = pd.DataFrame({
         "account_id": np.arange(1, n + 1),
-        "charge_off":  charge_off,
-        # Higher signal → lower noise → stronger model
-        "Model_A": make_score(latent_risk, signal_strength=2.5, noise_sd=0.6),
-        "Model_B": make_score(latent_risk, signal_strength=2.2, noise_sd=0.8),
-        "Model_C": make_score(latent_risk, signal_strength=1.6, noise_sd=1.2),
-        "Model_D": make_score(latent_risk, signal_strength=1.1, noise_sd=1.6),
-        "Model_E": make_score(latent_risk, signal_strength=0.4, noise_sd=2.2),
+        "charge_off": co,
+        "Model_A": score(2.5, 0.6),   # strong
+        "Model_B": score(2.2, 0.8),   # strong
+        "Model_C": score(1.6, 1.2),   # moderate
+        "Model_D": score(1.1, 1.6),   # weak
+        "Model_E": score(0.4, 2.2),   # near-noise
     })
-
-    # Introduce ~5 % missing values per score to mimic real data
     for col in ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]:
-        mask = np.random.rand(n) < 0.05
-        df.loc[mask, col] = np.nan
-
+        df.loc[np.random.rand(n) < 0.05, col] = np.nan
     return df
 
 
-# ─────────────────────────────────────────────
-# 2. EVALUATION METRICS
-# ─────────────────────────────────────────────
-def compute_ks(y_true, y_score) -> float:
-    """Kolmogorov-Smirnov statistic."""
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-    return float(np.max(np.abs(tpr - fpr)))
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. CONDITIONAL MUTUAL INFORMATION
+#
+# Theory recap:
+#   I(Y ; B | A) = H(Y | A) - H(Y | A, B)
+#
+#   H(Y | A)    = Σ_a  p(a)   · H(Y | A=a)       [entropy of Y within each A-bin]
+#   H(Y | A, B) = Σ_ab p(a,b) · H(Y | A=a, B=b)  [entropy of Y within each cell]
+#
+# We use the SYMMETRIC version:  CMI = [ I(Y;B|A) + I(Y;A|B) ] / 2
+# so neither model is privileged as "primary".
+#
+# Bins are fit on the TRAINING fold and applied to the TEST fold
+# to get an honest out-of-sample CMI estimate.
+# ──────────────────────────────────────────────────────────────────────────────
+def _h(p: float) -> float:
+    """Binary entropy H(p) in bits. Returns 0 for p ∈ {0, 1}."""
+    if p <= 0.0 or p >= 1.0:
+        return 0.0
+    return -p * np.log2(p) - (1.0 - p) * np.log2(1.0 - p)
 
 
-def compute_gini(auc: float) -> float:
-    """Gini = 2 * AUC - 1."""
-    return 2 * auc - 1
+def _make_cuts(scores: np.ndarray, n_bins: int) -> np.ndarray:
+    """Fit equal-population bin edges; extend to (-∞, +∞) for test-fold coverage."""
+    _, cuts = pd.qcut(scores, q=n_bins, retbins=True, duplicates="drop")
+    cuts[0], cuts[-1] = -np.inf, np.inf
+    return cuts
 
 
-def top_decile_capture(y_true, y_score) -> float:
-    """Fraction of charge-offs captured in the riskiest 10% of accounts."""
-    df_tmp = pd.DataFrame({"y": y_true, "s": y_score})
-    threshold = df_tmp["s"].quantile(0.10)   # bottom 10% of score = highest risk
-    top_decile = df_tmp[df_tmp["s"] <= threshold]
-    return top_decile["y"].sum() / max(y_true.sum(), 1)
+def _apply_cuts(scores: np.ndarray, cuts: np.ndarray) -> np.ndarray:
+    return np.array(pd.cut(scores, bins=cuts, labels=False), dtype=float)
 
 
-def evaluate_single_model(y_true, y_score, name: str) -> dict:
-    valid = ~np.isnan(y_score)
-    yt, ys = y_true[valid], y_score[valid]
-    # Invert score: low score = high risk → use negative for AUC
-    neg_score = -ys
-    auc  = roc_auc_score(yt, neg_score)
-    ks   = compute_ks(yt, neg_score)
-    gini = compute_gini(auc)
-    tdc  = top_decile_capture(yt, ys)
+def _h_y_given_a(y: np.ndarray, a_bins: np.ndarray) -> float:
+    """H(Y | A) — weighted average binary entropy within each A-bin."""
+    n, h = len(y), 0.0
+    for a_val in np.unique(a_bins[~np.isnan(a_bins)]):
+        mask = a_bins == a_val
+        h += mask.sum() / n * _h(y[mask].mean())
+    return h
+
+
+def _h_y_given_ab(y: np.ndarray, a_bins: np.ndarray, b_bins: np.ndarray) -> float:
+    """H(Y | A, B) — weighted average binary entropy within each (A, B) cell."""
+    n = len(y)
+    df_t = pd.DataFrame({"y": y, "a": a_bins, "b": b_bins}).dropna()
+    h = 0.0
+    for (_, grp) in df_t.groupby(["a", "b"]):
+        h += len(grp) / n * _h(grp["y"].mean())
+    return h
+
+
+def _cmi_one_direction(y, primary_bins, secondary_bins):
+    """I(Y ; secondary | primary) = H(Y|primary) - H(Y|primary, secondary)."""
+    return max(0.0, _h_y_given_a(y, primary_bins) - _h_y_given_ab(y, primary_bins, secondary_bins))
+
+
+def compute_cmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
+    """
+    5-fold CV CMI.
+
+    For each fold:
+      1. Fit quintile cuts on the training split (80 % of data).
+      2. Apply those cuts to the held-out test split (20 %).
+      3. Compute symmetric CMI on the test split only.
+
+    Reporting:
+      CMI_mean  — average across folds (primary ranking metric)
+      CMI_std   — fold-to-fold variability (stability check)
+      CMI_min   — worst fold (conservative lower bound)
+    """
+    sub = df[[m1, m2, "charge_off"]].dropna().reset_index(drop=True)
+    y, sa, sb = sub["charge_off"].values, sub[m1].values, sub[m2].values
+
+    kf   = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    vals = []
+
+    for tr_idx, te_idx in kf.split(y):
+        # Fit bins on training fold
+        cuts_a = _make_cuts(sa[tr_idx], N_BINS)
+        cuts_b = _make_cuts(sb[tr_idx], N_BINS)
+
+        # Apply to test fold
+        a_bins = _apply_cuts(sa[te_idx], cuts_a)
+        b_bins = _apply_cuts(sb[te_idx], cuts_b)
+        y_te   = y[te_idx]
+
+        # Symmetric: average both directions
+        cmi = (_cmi_one_direction(y_te, a_bins, b_bins) +
+               _cmi_one_direction(y_te, b_bins, a_bins)) / 2
+        vals.append(cmi)
+
     return {
-        "Model": name,
-        "N_valid": int(valid.sum()),
-        "ChargeOff_Rate": round(yt.mean(), 4),
-        "AUC":  round(auc,  4),
-        "KS":   round(ks,   4),
-        "Gini": round(gini, 4),
-        "Top10pct_Capture": round(tdc, 4),
+        "Pair":     f"{m1} + {m2}",
+        "N_valid":  len(sub),
+        "CMI_mean": round(np.mean(vals), 6),
+        "CMI_std":  round(np.std(vals),  6),
+        "CMI_min":  round(np.min(vals),  6),
     }
 
 
-def evaluate_combined_model(df: pd.DataFrame, m1: str, m2: str) -> dict:
-    """
-    Combine two models via logistic regression on available rows,
-    then evaluate the blended score.
-    """
-    sub = df[[m1, m2, "charge_off"]].dropna()
-    X = sub[[m1, m2]].values
-    y = sub["charge_off"].values
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    lr = LogisticRegression(max_iter=500)
-    lr.fit(X_scaled, y)
-    proba = lr.predict_proba(X_scaled)[:, 1]   # P(charge-off)
-
-    auc  = roc_auc_score(y, proba)
-    ks   = compute_ks(y, proba)
-    gini = compute_gini(auc)
-    tdc  = top_decile_capture(y, proba)
-
-    return {
-        "Model": f"{m1} + {m2}",
-        "N_valid": len(sub),
-        "ChargeOff_Rate": round(y.mean(), 4),
-        "AUC":  round(auc,  4),
-        "KS":   round(ks,   4),
-        "Gini": round(gini, 4),
-        "Top10pct_Capture": round(tdc, 4),
-        "LR_coef_m1": round(lr.coef_[0][0], 4),
-        "LR_coef_m2": round(lr.coef_[0][1], 4),
-    }
-
-
-# ─────────────────────────────────────────────
-# 3. SCORE GRID BUILDER
-# ─────────────────────────────────────────────
-def build_score_grid(df: pd.DataFrame, m1: str, m2: str,
-                     n_buckets: int = 5) -> pd.DataFrame:
-    """
-    Build a 2-D credit-risk tier grid using quintile buckets of m1 and m2.
-    Each cell shows: account count, charge-off count, charge-off rate.
-    """
-    sub = df[[m1, m2, "charge_off"]].dropna().copy()
-
-    # Quintile buckets (1 = riskiest, n_buckets = safest)
-    labels = list(range(n_buckets, 0, -1))   # 5,4,3,2,1
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. SCORE GRID — 5 × 5 QUINTILE BINS
+# ──────────────────────────────────────────────────────────────────────────────
+def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5) -> pd.DataFrame:
+    sub    = df[[m1, m2, "charge_off"]].dropna().copy()
+    labels = list(range(n_buckets, 0, -1))   # 5 = safest, 1 = riskiest
     sub[f"{m1}_tier"] = pd.qcut(sub[m1], q=n_buckets, labels=labels, duplicates="drop")
     sub[f"{m2}_tier"] = pd.qcut(sub[m2], q=n_buckets, labels=labels, duplicates="drop")
-
     grid = (
         sub.groupby([f"{m1}_tier", f"{m2}_tier"], observed=True)
-        .agg(
-            N=("charge_off", "count"),
-            ChargeOffs=("charge_off", "sum"),
-        )
+        .agg(N=("charge_off", "count"), ChargeOffs=("charge_off", "sum"))
         .reset_index()
     )
     grid["CO_Rate"] = (grid["ChargeOffs"] / grid["N"]).round(4)
-
-    # Assign a combined risk tier label
-    grid["Combined_Score"] = (
-        grid[f"{m1}_tier"].astype(int) + grid[f"{m2}_tier"].astype(int)
-    )
-    grid["Risk_Tier"] = pd.cut(
-        grid["Combined_Score"],
-        bins=[1, 3, 5, 7, 9, 10],
-        labels=["High Risk", "Medium-High", "Medium", "Medium-Low", "Low Risk"],
-        include_lowest=True,
-    )
-    return grid.sort_values([f"{m1}_tier", f"{m2}_tier"])
+    return grid
 
 
-def summarise_risk_tiers(grid: pd.DataFrame) -> pd.DataFrame:
-    """Roll up score grid to named risk tiers."""
-    summary = (
-        grid.groupby("Risk_Tier", observed=True)
-        .agg(
-            Accounts=("N", "sum"),
-            ChargeOffs=("ChargeOffs", "sum"),
-        )
-        .reset_index()
-    )
-    summary["CO_Rate"] = (summary["ChargeOffs"] / summary["Accounts"]).round(4)
-    summary["CO_Rate_Pct"] = (summary["CO_Rate"] * 100).round(2).astype(str) + "%"
-    total_co = summary["ChargeOffs"].sum()
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. TIER ASSIGNMENT — 1.5x WEIGHTED-AVERAGE CO RATE RULE
+#
+# Algorithm:
+#   1. Sort all 25 cells by CO rate ascending (lowest risk first).
+#   2. Enumerate every way to split the sorted list into N_TIERS contiguous
+#      blocks — C(n_cells - 1, N_TIERS - 1) = C(24, 4) = 10,626 combinations.
+#   3. For each candidate partition compute the weighted-average CO rate
+#      per tier (accounts-weighted).
+#   4. Keep only partitions where every consecutive tier pair satisfies
+#      avg_CO(Tier k+1) >= MULT × avg_CO(Tier k).
+#   5. Among valid partitions, pick the one that maximises the minimum
+#      achieved multiplier (most conservative / most separated).
+# ──────────────────────────────────────────────────────────────────────────────
+def _weighted_co(cells: pd.DataFrame) -> float:
+    return cells["ChargeOffs"].sum() / cells["N"].sum()
+
+
+def _find_best_split(cells: pd.DataFrame, n_tiers: int, mult: float):
+    """
+    Exhaustive search. Returns boundary list [0, s1, s2, s3, s4, n_cells]
+    or None if no valid partition exists.
+    """
+    nc = len(cells)
+    best_bounds, best_min_mult = None, -1.0
+
+    for splits in combinations(range(1, nc), n_tiers - 1):
+        bounds = (0,) + splits + (nc,)
+        rates  = [_weighted_co(cells.iloc[bounds[i]:bounds[i + 1]])
+                  for i in range(n_tiers)]
+
+        # Skip if any non-last tier has zero CO rate (can't compute ratio)
+        if any(r == 0.0 for r in rates[:-1]):
+            continue
+
+        mults = [rates[i + 1] / rates[i] for i in range(n_tiers - 1)]
+        if all(m >= mult for m in mults):
+            min_m = min(mults)
+            if min_m > best_min_mult:
+                best_min_mult = min_m
+                best_bounds   = bounds
+
+    return best_bounds
+
+
+def assign_tiers(grid: pd.DataFrame, n_tiers: int = N_TIERS,
+                 mult: float = MULT) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Assign each of the 25 score-grid cells to a named risk tier
+    using the 1.5x weighted-average CO rate rule.
+
+    Returns
+    -------
+    grid_tiered : original grid with 'Risk_Tier' column added
+    summary     : one row per tier with CO rate, multiplier, coverage
+    """
+    # Drop cells with no accounts or NaN CO rate before partitioning
+    cells = (grid.dropna(subset=["CO_Rate"])
+                 .sort_values("CO_Rate", ascending=True)
+                 .reset_index(drop=True))
+
+    bounds = _find_best_split(cells, n_tiers, mult)
+
+    if bounds is None:
+        print(f"  WARNING: No partition satisfies {mult}x rule with {n_tiers} tiers.")
+        print(f"           Falling back to equal-count split.")
+        nc     = len(cells)
+        chunk  = nc // n_tiers
+        bounds = tuple([i * chunk for i in range(n_tiers)] + [nc])
+
+    tier_names = ["Low Risk", "Medium-Low", "Medium", "Medium-High", "High Risk"]
+
+    # Assign tier label to each cell
+    tier_col = np.empty(len(cells), dtype=object)
+    summary_rows = []
+    for i in range(n_tiers):
+        grp  = cells.iloc[bounds[i]:bounds[i + 1]]
+        name = tier_names[i]
+        tier_col[bounds[i]:bounds[i + 1]] = name
+        summary_rows.append({
+            "Risk_Tier":   name,
+            "N_Cells":     len(grp),
+            "Accounts":    int(grp["N"].sum()),
+            "ChargeOffs":  int(grp["ChargeOffs"].sum()),
+            "Avg_CO_Rate": round(_weighted_co(grp), 4),
+        })
+
+    cells = cells.copy()
+    cells["Risk_Tier"] = tier_col
+
+    # Build summary with multipliers and coverage
+    summary = pd.DataFrame(summary_rows)
+    rates   = summary["Avg_CO_Rate"].values
+    summary["Multiplier_vs_Prev"] = ["-"] + [
+        f"{rates[i] / rates[i - 1]:.2f}x" for i in range(1, n_tiers)
+    ]
+    summary["CO_Rate_Pct"]    = (summary["Avg_CO_Rate"] * 100).round(1).astype(str) + "%"
+    total_co                  = summary["ChargeOffs"].sum()
     summary["Pct_of_All_COs"] = (
         (summary["ChargeOffs"] / total_co * 100).round(1).astype(str) + "%"
     )
-    return summary
+
+    # Merge tier label back onto the original grid (preserving all 25 rows)
+    tier_map   = cells[["CO_Rate", "Risk_Tier"]].drop_duplicates("CO_Rate")
+    grid_tiered = grid.merge(tier_map, on="CO_Rate", how="left")
+
+    return grid_tiered, summary
 
 
-# ─────────────────────────────────────────────
-# 4. MAIN PIPELINE
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. MAIN PIPELINE
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 70)
-    print("  CREDIT RISK SCORE SIMULATION & MODEL COMPARISON")
-    print("=" * 70)
+    sep = "=" * 70
+    print(sep)
+    print("  CREDIT RISK SCORE PIPELINE — v2")
+    print("  Pair Selection : CMI + Cross-Validation")
+    print("  Tier Assignment: 1.5x Weighted-Average CO Rate Rule")
+    print(sep)
 
-    # ── Simulate ──────────────────────────────
+    # ── Simulate ──────────────────────────────────────────────────────────────
     print(f"\n[1] Simulating {N:,} accounts …")
     df = simulate_dataset(N)
     print(f"    Overall Charge-Off Rate : {df['charge_off'].mean():.2%}")
-    print(f"    Missing values per score:")
-    for col in ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]:
-        print(f"      {col}: {df[col].isna().sum():,} ({df[col].isna().mean():.1%})")
 
-    # ── Single-model metrics ───────────────────
-    print("\n[2] Single-Model Performance")
+    # ── CMI pair ranking ──────────────────────────────────────────────────────
+    print(f"\n[2] CMI Pair Selection ({N_FOLDS}-fold CV, {N_BINS} quintile bins per score)")
+    print(f"    Symmetric CMI = [ I(Y;B|A) + I(Y;A|B) ] / 2  (units: bits)")
     print("-" * 70)
-    models = ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]
-    single_results = []
-    for m in models:
-        res = evaluate_single_model(df["charge_off"].values, df[m].values, m)
-        single_results.append(res)
 
-    single_df = pd.DataFrame(single_results).set_index("Model")
-    print(single_df[["AUC", "KS", "Gini", "Top10pct_Capture"]].to_string())
-    single_df.to_csv("single_model_metrics.csv")
+    models   = ["Model_A", "Model_B", "Model_C", "Model_D", "Model_E"]
+    cmi_rows = [compute_cmi_cv(df, m1, m2) for m1, m2 in combinations(models, 2)]
+    cmi_df   = (pd.DataFrame(cmi_rows)
+                  .sort_values("CMI_mean", ascending=False)
+                  .reset_index(drop=True))
 
-    # ── Pair model metrics ─────────────────────
-    print("\n[3] All Two-Model Combination Performance")
+    print(cmi_df.to_string(index=False))
+    cmi_df.to_csv("pair_cmi_rankings.csv", index=False)
+
+    best    = cmi_df.iloc[0]
+    best_m1, best_m2 = [m.strip() for m in best["Pair"].split("+")]
+    print(f"\n  ★  Best pair : {best['Pair']}")
+    print(f"     CMI mean   = {best['CMI_mean']:.6f} bits")
+    print(f"     CMI min    = {best['CMI_min']:.6f} bits  (worst fold — conservative bound)")
+    print(f"     CMI std    = {best['CMI_std']:.6f} bits  (fold stability)")
+
+    # ── Score grid ────────────────────────────────────────────────────────────
+    print(f"\n[3] 5×5 Score Grid  —  {best['Pair']}")
+    print("    (Tier 5 = Safest, Tier 1 = Riskiest)")
     print("-" * 70)
-    pair_results = []
-    for m1, m2 in combinations(models, 2):
-        res = evaluate_combined_model(df, m1, m2)
-        pair_results.append(res)
+    grid = build_score_grid(df, best_m1, best_m2)
+    grid.to_csv("score_grid_raw.csv", index=False)
 
-    pair_df = pd.DataFrame(pair_results).set_index("Model")
-    print(pair_df[["AUC", "KS", "Gini", "Top10pct_Capture"]].to_string())
-    pair_df.to_csv("pair_model_metrics.csv")
+    m1c, m2c = f"{best_m1}_tier", f"{best_m2}_tier"
+    pivot_co  = grid.pivot_table(index=m1c, columns=m2c, values="CO_Rate", aggfunc="mean")
+    pivot_co.index.name = f"{best_m1} ↓ / {best_m2} →"
+    print("\nCharge-Off Rate per cell:")
+    print(pivot_co.round(3).to_string())
 
-    # ── Rank & select best pair ────────────────
-    print("\n[4] Ranking & Selecting Best Two-Model Combination")
+    # ── 1.5x tier assignment ──────────────────────────────────────────────────
+    print(f"\n[4] Tier Assignment  —  {MULT}x Weighted-Average CO Rate Rule")
+    print(f"    Exhaustive search over C(n_cells-1, {N_TIERS}-1) split points")
     print("-" * 70)
-    # Composite rank: average rank across all four metrics
-    ranked = pair_df[["AUC", "KS", "Gini", "Top10pct_Capture"]].copy()
-    for col in ranked.columns:
-        ranked[f"rank_{col}"] = ranked[col].rank(ascending=False)
-    ranked["Composite_Rank"] = ranked[[c for c in ranked.columns if c.startswith("rank_")]].mean(axis=1)
-    ranked = ranked.sort_values("Composite_Rank")
+    grid_tiered, summary = assign_tiers(grid)
+    grid_tiered.to_csv("score_grid_tiered.csv", index=False)
+    summary.to_csv("risk_tier_summary.csv", index=False)
 
-    print("\nPair Rankings (lower composite rank = better):")
-    print(ranked[["AUC", "KS", "Gini", "Top10pct_Capture", "Composite_Rank"]].to_string())
-    ranked.to_csv("pair_model_rankings.csv")
+    # Tier summary table
+    print("\nRisk Tier Summary:")
+    display_cols = ["Risk_Tier", "N_Cells", "Accounts", "CO_Rate_Pct",
+                    "Multiplier_vs_Prev", "Pct_of_All_COs"]
+    print(summary[display_cols].to_string(index=False))
 
-    best_pair_name = ranked.index[0]
-    best_m1, best_m2 = [m.strip() for m in best_pair_name.split("+")]
-    best_metrics = pair_df.loc[best_pair_name]
+    # Multiplier validation
+    print("\nMultiplier validation (must be ≥ 1.50x):")
+    rates = summary["Avg_CO_Rate"].values
+    for i in range(1, N_TIERS):
+        ratio  = rates[i] / rates[i - 1]
+        status = "✓" if ratio >= MULT else "✗  <-- FAILS constraint"
+        print(f"  {summary['Risk_Tier'].iloc[i-1]:12s} → {summary['Risk_Tier'].iloc[i]:12s} : "
+              f"{rates[i-1]:.1%} → {rates[i]:.1%}   ({ratio:.2f}x)  {status}")
 
-    print(f"\n  ★  Best pair: {best_pair_name}")
-    print(f"     AUC={best_metrics['AUC']:.4f}  KS={best_metrics['KS']:.4f}"
-          f"  Gini={best_metrics['Gini']:.4f}  Top-Decile={best_metrics['Top10pct_Capture']:.4f}")
+    # Tier map on the grid
+    if "Risk_Tier" in grid_tiered.columns:
+        pivot_tier = grid_tiered.pivot_table(
+            index=m1c, columns=m2c, values="Risk_Tier", aggfunc="first"
+        )
+        pivot_tier.index.name = f"{best_m1} ↓ / {best_m2} →"
+        print(f"\nRisk Tier per cell:")
+        print(pivot_tier.to_string())
 
-    # ── Score grid for best pair ───────────────
-    print(f"\n[5] Score Grid — {best_pair_name}")
-    print("-" * 70)
-    grid = build_score_grid(df, best_m1, best_m2, n_buckets=5)
-    grid.to_csv("score_grid_detail.csv", index=False)
-
-    tier_summary = summarise_risk_tiers(grid)
-    print("\nCredit Risk Tier Summary:")
-    print(tier_summary.to_string(index=False))
-    tier_summary.to_csv("risk_tier_summary.csv", index=False)
-
-    # Pretty pivot for presentation
-    print(f"\nCharge-Off Rate Grid ({best_m1} Tier × {best_m2} Tier):")
-    print("  (Tier 5 = Safest, Tier 1 = Riskiest)")
-    pivot = grid.pivot_table(
-        index=f"{best_m1}_tier",
-        columns=f"{best_m2}_tier",
-        values="CO_Rate",
-        aggfunc="mean",
-    )
-    pivot.index.name   = f"{best_m1} ↓ / {best_m2} →"
-    print(pivot.round(3).to_string())
-
-    print("\n[6] Output files written:")
-    for f in ["single_model_metrics.csv", "pair_model_metrics.csv",
-              "pair_model_rankings.csv", "score_grid_detail.csv",
-              "risk_tier_summary.csv"]:
+    # ── Output files ──────────────────────────────────────────────────────────
+    print("\n[5] Files written:")
+    for f in ["pair_cmi_rankings.csv", "score_grid_raw.csv",
+              "score_grid_tiered.csv", "risk_tier_summary.csv"]:
         print(f"    {f}")
 
-    print("\n" + "=" * 70)
+    print("\n" + sep)
     print("  DONE")
-    print("=" * 70)
-    return df, ranked, grid, tier_summary
+    print(sep)
+
+    return df, cmi_df, grid_tiered, summary
 
 
 if __name__ == "__main__":
-    df, ranked, grid, tier_summary = main()
+    df, cmi_df, grid_tiered, summary = main()

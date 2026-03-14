@@ -1,0 +1,26 @@
+Model_A_tier,Model_E_tier,N,ChargeOffs,CO_Rate,Risk_Tier
+5,5,2499,2037,0.8151,High Risk
+5,4,1999,1587,0.7939,High Risk
+5,3,1819,1450,0.7971,High Risk
+5,2,1517,1200,0.791,High Risk
+5,1,1290,1025,0.7946,High Risk
+4,5,2078,1165,0.5606,High Risk
+4,4,1890,1096,0.5799,High Risk
+4,3,1840,1023,0.556,High Risk
+4,2,1636,938,0.5733,High Risk
+4,1,1560,837,0.5365,Medium-High
+3,5,1811,742,0.4097,Medium-High
+3,4,1836,743,0.4047,Medium-High
+3,3,1766,680,0.3851,Medium
+3,2,1847,726,0.3931,Medium-High
+3,1,1766,693,0.3924,Medium-High
+2,5,1553,374,0.2408,Medium
+2,4,1843,413,0.2241,Medium
+2,3,1857,403,0.217,Medium
+2,2,1898,417,0.2197,Medium
+2,1,1967,421,0.214,Medium-Low
+1,5,1218,106,0.087,Medium-Low
+1,4,1536,134,0.0872,Medium-Low
+1,3,1793,153,0.0853,Low Risk
+1,2,1984,162,0.0817,Low Risk
+1,1,2335,199,0.0852,Low Risk
