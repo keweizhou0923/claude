@@ -186,20 +186,19 @@ def compute_pair_metrics_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. PAIR TABLE  —  matplotlib figure showing both CMI and JMI, ranked by CMI
+# 4. PAIR TABLE  —  both metrics shown; rows sorted by JMI (selection criterion)
+#    Each pair carries both a JMI rank and a CMI rank so the contrast is visible
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_pair_table(pair_df: pd.DataFrame) -> None:
-    fig, ax = plt.subplots(figsize=(12, 4))
+    fig, ax = plt.subplots(figsize=(14, 4))
     ax.axis("off")
 
-    display = pair_df[["Pair", "N_valid", "CMI_mean", "CMI_std", "JMI_mean", "JMI_std"]].copy()
-    display.columns = ["Model Pair", "N Valid",
-                       "CMI Mean (bits)", "CMI Std",
-                       "JMI Mean (bits)", "JMI Std"]
-    display["Rank"] = range(1, len(display) + 1)
-    display = display[["Rank", "Model Pair", "N Valid",
-                        "CMI Mean (bits)", "CMI Std",
-                        "JMI Mean (bits)", "JMI Std"]]
+    display = pair_df[["JMI_Rank", "CMI_Rank", "Pair", "N_valid",
+                        "JMI_mean", "JMI_std",
+                        "CMI_mean", "CMI_std"]].copy()
+    display.columns = ["JMI Rank", "CMI Rank", "Model Pair", "N Valid",
+                       "JMI Mean (bits)", "JMI Std",
+                       "CMI Mean (bits)", "CMI Std"]
 
     tbl = ax.table(
         cellText=display.values,
@@ -212,16 +211,17 @@ def plot_pair_table(pair_df: pd.DataFrame) -> None:
     tbl.scale(1, 1.6)
 
     n_cols = len(display.columns)
+    # Base header colour
     for j in range(n_cols):
         tbl[0, j].set_facecolor("#2c3e50")
         tbl[0, j].set_text_props(color="white", fontweight="bold")
+    # JMI columns (0,4,5) → dark green; CMI columns (1,6,7) → dark blue
+    for j in (0, 4, 5):
+        tbl[0, j].set_facecolor("#145a32")
+    for j in (1, 6, 7):
+        tbl[0, j].set_facecolor("#1a5276")
 
-    # Shade CMI columns (3,4) and JMI columns (5,6) with distinct header tints
-    for j in (3, 4):
-        tbl[0, j].set_facecolor("#1a5276")   # darker blue for CMI header
-    for j in (5, 6):
-        tbl[0, j].set_facecolor("#145a32")   # dark green for JMI header
-
+    # Highlight best pair (rank 1 = highest JMI = first row)
     for j in range(n_cols):
         tbl[1, j].set_facecolor("#d5f5e3")
         tbl[1, j].set_text_props(fontweight="bold")
@@ -232,7 +232,7 @@ def plot_pair_table(pair_df: pd.DataFrame) -> None:
             tbl[i, j].set_facecolor(clr)
 
     ax.set_title(
-        "Pair Ranking  (5-fold CV · ranked by CMI  |  JMI shown for reference)",
+        "Pair Ranking — sorted by JMI  (CMI rank shown for comparison)",
         fontsize=11, fontweight="bold", pad=12)
     plt.tight_layout()
     plt.savefig("pair_table.png", bbox_inches="tight")
@@ -498,22 +498,24 @@ def main():
     plot_lorenz_curves(df)
 
     # ── pair selection: CMI + JMI ─────────────────────────────────────────────
-    print(f"\n[3] Pair Selection — CMI & JMI ({N_FOLDS}-fold CV, ranked by CMI)")
+    print(f"\n[3] Pair Selection — CMI & JMI ({N_FOLDS}-fold CV, selected by JMI)")
     print("-" * 70)
     pair_rows = [compute_pair_metrics_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
     pair_df   = (pd.DataFrame(pair_rows)
-                   .sort_values("CMI_mean", ascending=False)
+                   .sort_values("JMI_mean", ascending=False)
                    .reset_index(drop=True))
+    pair_df["JMI_Rank"] = range(1, len(pair_df) + 1)
+    pair_df["CMI_Rank"] = pair_df["CMI_mean"].rank(ascending=False, method="first").astype(int)
 
     print(pair_df.to_string(index=False))
     pair_df.to_csv("pair_rankings.csv", index=False)
     plot_pair_table(pair_df)
 
-    best    = pair_df.iloc[0]
+    best    = pair_df.iloc[0]   # highest JMI
     best_m1, best_m2 = [m.strip() for m in best["Pair"].split("+")]
     print(f"\n  ★  Best pair : {best['Pair']}")
-    print(f"     CMI mean   = {best['CMI_mean']:.6f} bits  (ranking criterion — complementarity)")
-    print(f"     JMI mean   = {best['JMI_mean']:.6f} bits  (total combined information)")
+    print(f"     JMI mean   = {best['JMI_mean']:.6f} bits  (selection criterion — total combined information)")
+    print(f"     CMI mean   = {best['CMI_mean']:.6f} bits  (complementarity, CMI rank #{best['CMI_Rank']})")
 
     # ── score grid ────────────────────────────────────────────────────────────
     print(f"\n[4] Building 5×5 Score Grid — {best['Pair']}")

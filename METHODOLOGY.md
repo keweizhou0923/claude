@@ -61,7 +61,7 @@ The area under the CAP/Lorenz curve (`AUC_lorenz`) and the ROC AUC are different
 
 ---
 
-## 3. Pair Selection — CMI (ranking) + JMI (diagnostic)
+## 3. Pair Selection — JMI (ranking) + CMI (diagnostic)
 
 ### Why Not Logistic Regression Blending?
 The v1 approach combined each pair with logistic regression and measured the blended AUC. This has three problems:
@@ -71,9 +71,18 @@ The v1 approach combined each pair with logistic regression and measured the ble
 
 ### Two Metrics, One CV Loop
 
-Both CMI and JMI are computed in the same cross-validation loop, sharing the same bin fitting and test-fold evaluation.
+Both JMI and CMI are computed in the same cross-validation loop, sharing the same bin fitting and test-fold evaluation.
 
-#### CMI — Ranking Criterion
+#### JMI — Selection Criterion
+```
+JMI  =  I(Y ; A, B)  =  H(Y) − H(Y | A, B)
+```
+
+Measures the **total combined information** the pair carries about charge-off. Since `H(Y)` is constant across all pairs, ranking by JMI is equivalent to ranking by `−H(Y|A,B)` — the pair that leaves the least residual uncertainty about charge-off.
+
+**Why JMI for ranking:** JMI measures the pair's absolute discrimination ceiling. Selecting the highest-JMI pair maximises total predictive power — we prefer the pair that can explain the most charge-off signal, regardless of how that signal is distributed between the two models.
+
+#### CMI — Diagnostic Reference
 ```
 CMI  =  [ I(Y;B|A)  +  I(Y;A|B) ] / 2
       =  [ H(Y|A) − H(Y|A,B)  +  H(Y|B) − H(Y|A,B) ] / 2
@@ -81,24 +90,15 @@ CMI  =  [ I(Y;B|A)  +  I(Y;A|B) ] / 2
 
 Measures how much **new information** each model adds beyond the other. Symmetric — neither model is treated as primary.
 
-**Why CMI for ranking:** It is unaffected by individual model dominance. A pair where one model is very strong and the other is irrelevant will score near zero on CMI, because the irrelevant model adds nothing beyond what the strong model already knows. Pairs of two genuinely complementary models score high regardless of their individual strength.
-
-#### JMI — Diagnostic Reference
-```
-JMI  =  I(Y ; A, B)  =  H(Y) − H(Y | A, B)
-```
-
-Measures the **total combined information** the pair carries about charge-off. Since `H(Y)` is constant across all pairs, ranking by JMI is equivalent to ranking by `−H(Y|A,B)` — the pair that leaves the least residual uncertainty about charge-off.
-
-**Why JMI is shown but not used for ranking:** JMI is dominated by the stronger individual model. A pair where A has Gini=0.85 and B is irrelevant (Gini=0.10, unrelated to A) can outrank a pair of two complementary Gini=0.60 models simply because A's individual power dwarfs any complementarity benefit. JMI reflects total discrimination ceiling; CMI reflects efficient use of two model slots.
+**Why CMI is shown but not used for ranking:** CMI is unaffected by individual model strength. A pair where one model is very strong and the other is irrelevant will score near zero on CMI, because the irrelevant model adds nothing beyond what the strong model already knows — but the strong model alone may still be highly predictive. Optimising for CMI can therefore lead to selecting a pair of two mediocre complementary models over a pair of two strong models.
 
 **Reading the two metrics together:**
 
-| CMI | JMI | Interpretation |
+| JMI | CMI | Interpretation |
 |---|---|---|
-| High | High | Both models are strong AND complementary — best case |
-| High | Low  | Complementary but both models are individually weak |
-| Low  | High | Both models are strong but largely redundant |
+| High | High | Both models are strong AND complementary — ideal |
+| High | Low  | Both models are strong but largely redundant — best predictive ceiling, governance note |
+| Low  | High | Complementary but both models are individually weak |
 | Low  | Low  | Neither model is informative |
 
 ### Discretisation
@@ -119,18 +119,18 @@ The `−inf / +inf` extension on bin edges ensures that test-fold scores outside
 - `JMI_mean` / `JMI_std`: total combined information — diagnostic reference column
 
 ### Result Interpretation
-| Pair | CMI (bits) | JMI (bits) | Interpretation |
+| Pair | JMI (bits) | CMI (bits) | Interpretation |
 |---|---|---|---|
-| Model_A + Model_E | 0.084 | 0.170 | E adds unique signal; A is strong → good combination |
-| Model_A + Model_B | 0.016 | 0.178 | Both strong (high JMI) but largely redundant (low CMI) |
-| Model_D + Model_E | 0.026 | 0.052 | Both weak — low on both metrics |
+| Model_A + Model_B | 0.178 | 0.016 | Both strong → highest predictive ceiling; redundant (JMI rank #1, CMI rank low) |
+| Model_A + Model_E | 0.170 | 0.084 | A is strong, E adds unique signal; JMI rank #2, CMI rank #1 |
+| Model_D + Model_E | 0.052 | 0.026 | Both weak — low on both metrics |
 
-A and B are both driven by the same strong latent signal — highly correlated, so CMI is near zero. E, despite being near-noise on its own (low JMI contribution), captures residual variance in Z that A does not — hence the high CMI.
+**Winner: Model_A + Model_B** — selected for highest JMI (total predictive power). The low CMI is a governance flag: both models are driven by the same strong latent signal and are highly correlated, so one model's marginal contribution is small. This is useful context for vendor diversification decisions.
 
 **Alternatives considered:**
+- **Ranking by CMI alone**: would select A+E — E adds unique residual signal, but the pair's total discrimination ceiling is lower than A+B. Optimising complementarity at the cost of absolute predictive power.
 - **Marginal AUC lift** (AUC of pair minus AUC of primary model alone): converges with CMI when a flexible combiner is used, but depends on the combiner and assumes one model is fixed as primary.
 - **Score correlation penalty**: simple, penalises correlated pairs, but Pearson/Spearman correlation does not capture non-linear dependence.
-- **Ranking by JMI alone**: would select A+B — both strong, but the two model slots carry overlapping risk signals and one effectively goes to waste.
 - **Concordance/discordance analysis**: diagnostic tool — useful for explaining results to stakeholders after the pair is chosen.
 
 ---
