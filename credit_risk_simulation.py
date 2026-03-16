@@ -3,9 +3,9 @@ Credit Risk Score Pipeline — v2
 ================================
 Changes from v1:
   - Overall CO rate adjusted to ~25%
-  - Pair selection: CMI + k-fold CV
+  - Pair selection: JMI + k-fold CV (CMI shown as complementarity diagnostic)
   - Tier assignment: 1.5x weighted-average CO rate rule
-  - Outputs: Lorenz curves, CMI table, coloured score grid with annotations
+  - Outputs: Lorenz curves, JMI/CMI pair table, coloured score grid with annotations
 """
 
 import numpy as np
@@ -100,7 +100,6 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
     # Random-model diagonal
     ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random model")
 
-    ax.fill_between([0, 1], [0, 1], [0, 1], alpha=0)   # invisible — keeps layout clean
     ax.set_xlabel("Cumulative % of Accounts  (sorted riskiest → safest)")
     ax.set_ylabel("Cumulative % of Charge-Offs Captured")
     ax.set_title("Lorenz Curves — Model Comparison", fontsize=12, fontweight="bold")
@@ -121,16 +120,16 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
 # 3. PAIR METRIC FUNCTIONS
 #    Two complementary metrics computed in a single CV loop:
 #
-#    CMI  (ranking criterion)
+#    JMI  (selection criterion — total combined power)
+#      Joint MI = H(Y) − H(Y|A,B)
+#      Measures total combined information the pair carries about charge-off.
+#      Selecting the highest-JMI pair maximises the pair's predictive ceiling.
+#
+#    CMI  (diagnostic — complementarity)
 #      Symmetric conditional MI = [I(Y;B|A) + I(Y;A|B)] / 2
 #      = [H(Y|A) + H(Y|B) − 2·H(Y|A,B)] / 2
 #      Measures how much NEW information each model adds beyond the other.
-#      Rewards complementarity; unaffected by individual model dominance.
-#
-#    JMI  (diagnostic — total combined power)
-#      Joint MI = H(Y) − H(Y|A,B)
-#      Measures total combined information the pair carries about charge-off.
-#      Symmetric, but dominated by the stronger individual model in the pair.
+#      Low CMI with high JMI signals strong but redundant models (governance flag).
 # ──────────────────────────────────────────────────────────────────────────────
 def _h(p: float) -> float:
     if p <= 0.0 or p >= 1.0:
@@ -370,7 +369,7 @@ def plot_score_grid(grid_tiered: pd.DataFrame, m1: str, m2: str,
     ax2 = fig.add_subplot(gs[1])
     ax2.axis("off")
 
-    tier_labels_int = [1, 2, 3, 4, 5]   # tier 1=safest, 5=riskiest
+    tier_labels_int = list(range(1, N_TIERS + 1))   # tier 1=safest, N_TIERS=riskiest
 
     # ── draw cells ────────────────────────────────────────────────────────────
     for _, row in grid_tiered.iterrows():
@@ -465,10 +464,9 @@ def plot_score_grid(grid_tiered: pd.DataFrame, m1: str, m2: str,
         y_pos -= 0.22
 
     # CO rate cut-point dividers between tiers (skip last)
-    y_pos2 = 0.97
     for idx in range(len(TIER_ORDER) - 1):
         cutoff = co_cuts[idx]
-        ax2.text(0.50, y_pos2 - 0.22 * (idx + 1) + 0.01,
+        ax2.text(0.50, 0.97 - 0.22 * (idx + 1) + 0.01,
                  f"── CO cut: {cutoff:.1%} ──",
                  transform=ax2.transAxes, ha="center", va="center",
                  fontsize=7, color="#888888", style="italic")
@@ -490,8 +488,7 @@ def main():
     # ── simulate ──────────────────────────────────────────────────────────────
     print(f"\n[1] Simulating {N:,} accounts (target CO ≈ 25%) …")
     df = simulate_dataset(N)
-    actual_co = df["charge_off"].mean()
-    print(f"    Actual Charge-Off Rate : {actual_co:.2%}")
+    print(f"    Actual Charge-Off Rate : {df['charge_off'].mean():.2%}")
 
     # ── Lorenz curves ──────────────────────────────────────────────────────────
     print("\n[2] Lorenz Curves")
