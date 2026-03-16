@@ -61,7 +61,7 @@ The area under the CAP/Lorenz curve (`AUC_lorenz`) and the ROC AUC are different
 
 ---
 
-## 3. Pair Selection — Conditional Mutual Information (CMI)
+## 3. Pair Selection — CMI (ranking) + JMI (diagnostic)
 
 ### Why Not Logistic Regression Blending?
 The v1 approach combined each pair with logistic regression and measured the blended AUC. This has three problems:
@@ -69,17 +69,37 @@ The v1 approach combined each pair with logistic regression and measured the ble
 2. **In-sample bias:** The LR is evaluated on the same data it was trained on, inflating AUC.
 3. **Linear assumption:** LR only captures the linear portion of each model's incremental signal.
 
-### CMI Definition
+### Two Metrics, One CV Loop
 
+Both CMI and JMI are computed in the same cross-validation loop, sharing the same bin fitting and test-fold evaluation.
+
+#### CMI — Ranking Criterion
 ```
-I(Y ; B | A) = H(Y | A) − H(Y | A, B)
+CMI  =  [ I(Y;B|A)  +  I(Y;A|B) ] / 2
+      =  [ H(Y|A) − H(Y|A,B)  +  H(Y|B) − H(Y|A,B) ] / 2
 ```
 
-- `H(Y | A)`: entropy of charge-off within each bin of Model A — how uncertain we still are about charge-off after knowing A's score
-- `H(Y | A, B)`: entropy of charge-off within each (A-bin, B-bin) cell — residual uncertainty after knowing both scores
-- The difference is the information B adds beyond A
+Measures how much **new information** each model adds beyond the other. Symmetric — neither model is treated as primary.
 
-**Symmetric version:** `CMI = [ I(Y;B|A) + I(Y;A|B) ] / 2` so neither model is treated as primary. This matters when the two models have different score distributions.
+**Why CMI for ranking:** It is unaffected by individual model dominance. A pair where one model is very strong and the other is irrelevant will score near zero on CMI, because the irrelevant model adds nothing beyond what the strong model already knows. Pairs of two genuinely complementary models score high regardless of their individual strength.
+
+#### JMI — Diagnostic Reference
+```
+JMI  =  I(Y ; A, B)  =  H(Y) − H(Y | A, B)
+```
+
+Measures the **total combined information** the pair carries about charge-off. Since `H(Y)` is constant across all pairs, ranking by JMI is equivalent to ranking by `−H(Y|A,B)` — the pair that leaves the least residual uncertainty about charge-off.
+
+**Why JMI is shown but not used for ranking:** JMI is dominated by the stronger individual model. A pair where A has Gini=0.85 and B is irrelevant (Gini=0.10, unrelated to A) can outrank a pair of two complementary Gini=0.60 models simply because A's individual power dwarfs any complementarity benefit. JMI reflects total discrimination ceiling; CMI reflects efficient use of two model slots.
+
+**Reading the two metrics together:**
+
+| CMI | JMI | Interpretation |
+|---|---|---|
+| High | High | Both models are strong AND complementary — best case |
+| High | Low  | Complementary but both models are individually weak |
+| Low  | High | Both models are strong but largely redundant |
+| Low  | Low  | Neither model is informative |
 
 ### Discretisation
 Continuous scores are binned into **quintiles (5 bins)** before computing entropy. This is necessary because entropy is defined over discrete distributions.
@@ -90,26 +110,27 @@ Continuous scores are binned into **quintiles (5 bins)** before computing entrop
 - For larger portfolios (500k+), deciles are appropriate.
 
 ### Cross-Validation (5-fold)
-Bin boundaries are **fit on the training fold (80%)** and applied to the **test fold (20%)**. CMI is computed only on the test fold. This prevents in-sample inflation.
+Bin boundaries are **fit on the training fold (80%)** and applied to the **test fold (20%)**. Both CMI and JMI are computed only on the test fold. This prevents in-sample inflation.
 
 The `−inf / +inf` extension on bin edges ensures that test-fold scores outside the training range are always assigned to a valid bin rather than NaN.
 
-**Reported metrics:**
-- `CMI_mean`: average across 5 folds — primary ranking criterion
-- `CMI_std`: fold-to-fold variability — stability check (low std = robust signal)
-- `CMI_min`: worst fold — conservative lower bound for pair quality
+**Reported metrics per pair:**
+- `CMI_mean` / `CMI_std`: average and variability across 5 folds — **primary ranking column**
+- `JMI_mean` / `JMI_std`: total combined information — diagnostic reference column
 
 ### Result Interpretation
-| Pair | CMI (bits) | Interpretation |
-|---|---|---|
-| Model_A + Model_E | 0.084 | E adds unique signal not in A |
-| Model_A + Model_B | 0.016 | B is nearly redundant with A |
+| Pair | CMI (bits) | JMI (bits) | Interpretation |
+|---|---|---|---|
+| Model_A + Model_E | 0.084 | 0.170 | E adds unique signal; A is strong → good combination |
+| Model_A + Model_B | 0.016 | 0.178 | Both strong (high JMI) but largely redundant (low CMI) |
+| Model_D + Model_E | 0.026 | 0.052 | Both weak — low on both metrics |
 
-A and B are both driven by the same strong latent signal — they are highly correlated and one adds little beyond the other. E, despite being near-noise on its own, captures residual variance in Z that A does not, making it a genuinely complementary second model.
+A and B are both driven by the same strong latent signal — highly correlated, so CMI is near zero. E, despite being near-noise on its own (low JMI contribution), captures residual variance in Z that A does not — hence the high CMI.
 
 **Alternatives considered:**
-- **Marginal AUC lift** (AUC of pair minus AUC of primary model alone): converges with CMI when a flexible combiner is used, but depends on the combiner choice and cannot detect non-linear complementarity with a linear combiner.
+- **Marginal AUC lift** (AUC of pair minus AUC of primary model alone): converges with CMI when a flexible combiner is used, but depends on the combiner and assumes one model is fixed as primary.
 - **Score correlation penalty**: simple, penalises correlated pairs, but Pearson/Spearman correlation does not capture non-linear dependence.
+- **Ranking by JMI alone**: would select A+B — both strong, but the two model slots carry overlapping risk signals and one effectively goes to waste.
 - **Concordance/discordance analysis**: diagnostic tool — useful for explaining results to stakeholders after the pair is chosen.
 
 ---

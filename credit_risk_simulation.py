@@ -118,10 +118,19 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. JMI FUNCTIONS
-#    Joint Mutual Information  I(Y ; A, B) = H(Y) − H(Y | A, B)
-#    Symmetric by construction — no primary/secondary model ordering.
-#    Rewards pairs where BOTH models are individually strong AND complementary.
+# 3. PAIR METRIC FUNCTIONS
+#    Two complementary metrics computed in a single CV loop:
+#
+#    CMI  (ranking criterion)
+#      Symmetric conditional MI = [I(Y;B|A) + I(Y;A|B)] / 2
+#      = [H(Y|A) + H(Y|B) − 2·H(Y|A,B)] / 2
+#      Measures how much NEW information each model adds beyond the other.
+#      Rewards complementarity; unaffected by individual model dominance.
+#
+#    JMI  (diagnostic — total combined power)
+#      Joint MI = H(Y) − H(Y|A,B)
+#      Measures total combined information the pair carries about charge-off.
+#      Symmetric, but dominated by the stronger individual model in the pair.
 # ──────────────────────────────────────────────────────────────────────────────
 def _h(p: float) -> float:
     if p <= 0.0 or p >= 1.0:
@@ -136,6 +145,13 @@ def _make_cuts(scores, n_bins):
 def _apply_cuts(scores, cuts):
     return np.array(pd.cut(scores, bins=cuts, labels=False), dtype=float)
 
+def _h_y_given_a(y, a_bins):
+    n, h = len(y), 0.0
+    for av in np.unique(a_bins[~np.isnan(a_bins)]):
+        m = a_bins == av
+        h += m.sum() / n * _h(y[m].mean())
+    return h
+
 def _h_y_given_ab(y, a_bins, b_bins):
     n = len(y)
     dt = pd.DataFrame({"y": y, "a": a_bins, "b": b_bins}).dropna()
@@ -144,37 +160,46 @@ def _h_y_given_ab(y, a_bins, b_bins):
         h += len(grp) / n * _h(grp["y"].mean())
     return h
 
-def compute_jmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
-    """I(Y; A, B) = H(Y) - H(Y|A,B) with k-fold CV.  Bins fit on train fold only."""
+def compute_pair_metrics_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
+    """Compute symmetric CMI and JMI for a model pair via k-fold CV."""
     sub = df[[m1, m2, "charge_off"]].dropna().reset_index(drop=True)
     y, sa, sb = sub["charge_off"].values, sub[m1].values, sub[m2].values
-    kf, vals = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42), []
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+    cmi_vals, jmi_vals = [], []
     for tr, te in kf.split(y):
-        ca, cb = _make_cuts(sa[tr], N_BINS), _make_cuts(sb[tr], N_BINS)
-        ab, bb = _apply_cuts(sa[te], ca), _apply_cuts(sb[te], cb)
-        h_y    = _h(y[te].mean())               # H(Y) on test fold
-        h_y_ab = _h_y_given_ab(y[te], ab, bb)   # H(Y|A,B) on test fold
-        vals.append(max(0.0, h_y - h_y_ab))
+        ca, cb  = _make_cuts(sa[tr], N_BINS), _make_cuts(sb[tr], N_BINS)
+        ab, bb  = _apply_cuts(sa[te], ca),    _apply_cuts(sb[te], cb)
+        h_y     = _h(y[te].mean())
+        h_y_a   = _h_y_given_a(y[te], ab)
+        h_y_b   = _h_y_given_a(y[te], bb)
+        h_y_ab  = _h_y_given_ab(y[te], ab, bb)
+        cmi_vals.append((max(0.0, h_y_a - h_y_ab) + max(0.0, h_y_b - h_y_ab)) / 2)
+        jmi_vals.append(max(0.0, h_y - h_y_ab))
     return {
         "Pair":     f"{m1} + {m2}",
         "N_valid":  len(sub),
-        "JMI_mean": round(np.mean(vals), 6),
-        "JMI_std":  round(np.std(vals),  6),
-        "JMI_min":  round(np.min(vals),  6),
+        "CMI_mean": round(np.mean(cmi_vals), 6),
+        "CMI_std":  round(np.std(cmi_vals),  6),
+        "JMI_mean": round(np.mean(jmi_vals), 6),
+        "JMI_std":  round(np.std(jmi_vals),  6),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. JMI TABLE  —  matplotlib figure of the ranked pair table
+# 4. PAIR TABLE  —  matplotlib figure showing both CMI and JMI, ranked by CMI
 # ──────────────────────────────────────────────────────────────────────────────
-def plot_jmi_table(jmi_df: pd.DataFrame) -> None:
-    fig, ax = plt.subplots(figsize=(9, 4))
+def plot_pair_table(pair_df: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(12, 4))
     ax.axis("off")
 
-    display = jmi_df[["Pair", "N_valid", "JMI_mean", "JMI_std", "JMI_min"]].copy()
-    display.columns = ["Model Pair", "N Valid", "JMI Mean (bits)", "JMI Std", "JMI Min (bits)"]
+    display = pair_df[["Pair", "N_valid", "CMI_mean", "CMI_std", "JMI_mean", "JMI_std"]].copy()
+    display.columns = ["Model Pair", "N Valid",
+                       "CMI Mean (bits)", "CMI Std",
+                       "JMI Mean (bits)", "JMI Std"]
     display["Rank"] = range(1, len(display) + 1)
-    display = display[["Rank", "Model Pair", "N Valid", "JMI Mean (bits)", "JMI Std", "JMI Min (bits)"]]
+    display = display[["Rank", "Model Pair", "N Valid",
+                        "CMI Mean (bits)", "CMI Std",
+                        "JMI Mean (bits)", "JMI Std"]]
 
     tbl = ax.table(
         cellText=display.values,
@@ -183,31 +208,36 @@ def plot_jmi_table(jmi_df: pd.DataFrame) -> None:
         loc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
+    tbl.set_fontsize(8.5)
     tbl.scale(1, 1.6)
 
-    # Header styling
-    for j in range(len(display.columns)):
+    n_cols = len(display.columns)
+    for j in range(n_cols):
         tbl[0, j].set_facecolor("#2c3e50")
         tbl[0, j].set_text_props(color="white", fontweight="bold")
 
-    # Highlight best pair (rank 1)
-    for j in range(len(display.columns)):
+    # Shade CMI columns (3,4) and JMI columns (5,6) with distinct header tints
+    for j in (3, 4):
+        tbl[0, j].set_facecolor("#1a5276")   # darker blue for CMI header
+    for j in (5, 6):
+        tbl[0, j].set_facecolor("#145a32")   # dark green for JMI header
+
+    for j in range(n_cols):
         tbl[1, j].set_facecolor("#d5f5e3")
         tbl[1, j].set_text_props(fontweight="bold")
 
-    # Alternating row shading
     for i in range(2, len(display) + 1):
         clr = "#f8f9fa" if i % 2 == 0 else "white"
-        for j in range(len(display.columns)):
+        for j in range(n_cols):
             tbl[i, j].set_facecolor(clr)
 
-    ax.set_title("JMI Pair Ranking  (5-fold CV · Symmetric · sorted by JMI Mean)",
-                 fontsize=11, fontweight="bold", pad=12)
+    ax.set_title(
+        "Pair Ranking  (5-fold CV · ranked by CMI  |  JMI shown for reference)",
+        fontsize=11, fontweight="bold", pad=12)
     plt.tight_layout()
-    plt.savefig("jmi_table.png", bbox_inches="tight")
+    plt.savefig("pair_table.png", bbox_inches="tight")
     plt.close()
-    print("    Saved: jmi_table.png")
+    print("    Saved: pair_table.png")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -467,23 +497,23 @@ def main():
     print("\n[2] Lorenz Curves")
     plot_lorenz_curves(df)
 
-    # ── JMI pair selection ────────────────────────────────────────────────────
-    print(f"\n[3] JMI Pair Selection ({N_FOLDS}-fold CV)")
+    # ── pair selection: CMI + JMI ─────────────────────────────────────────────
+    print(f"\n[3] Pair Selection — CMI & JMI ({N_FOLDS}-fold CV, ranked by CMI)")
     print("-" * 70)
-    jmi_rows = [compute_jmi_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
-    jmi_df   = (pd.DataFrame(jmi_rows)
-                  .sort_values("JMI_mean", ascending=False)
-                  .reset_index(drop=True))
+    pair_rows = [compute_pair_metrics_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
+    pair_df   = (pd.DataFrame(pair_rows)
+                   .sort_values("CMI_mean", ascending=False)
+                   .reset_index(drop=True))
 
-    print(jmi_df.to_string(index=False))
-    jmi_df.to_csv("pair_jmi_rankings.csv", index=False)
-    plot_jmi_table(jmi_df)
+    print(pair_df.to_string(index=False))
+    pair_df.to_csv("pair_rankings.csv", index=False)
+    plot_pair_table(pair_df)
 
-    best    = jmi_df.iloc[0]
+    best    = pair_df.iloc[0]
     best_m1, best_m2 = [m.strip() for m in best["Pair"].split("+")]
     print(f"\n  ★  Best pair : {best['Pair']}")
-    print(f"     JMI mean   = {best['JMI_mean']:.6f} bits")
-    print(f"     JMI min    = {best['JMI_min']:.6f} bits")
+    print(f"     CMI mean   = {best['CMI_mean']:.6f} bits  (ranking criterion — complementarity)")
+    print(f"     JMI mean   = {best['JMI_mean']:.6f} bits  (total combined information)")
 
     # ── score grid ────────────────────────────────────────────────────────────
     print(f"\n[4] Building 5×5 Score Grid — {best['Pair']}")
@@ -526,8 +556,8 @@ def main():
 
     # ── output summary ─────────────────────────────────────────────────────────
     print("\n[7] Files written:")
-    for f in ["lorenz_curves.png", "jmi_table.png",
-              "pair_jmi_rankings.csv", "score_grid_raw.csv",
+    for f in ["lorenz_curves.png", "pair_table.png",
+              "pair_rankings.csv", "score_grid_raw.csv",
               "score_grid_tiered.csv", "risk_tier_summary.csv",
               "score_grid_chart.png"]:
         print(f"    {f}")
@@ -536,8 +566,8 @@ def main():
     print("  DONE")
     print(sep)
 
-    return df, jmi_df, grid_tiered, summary
+    return df, pair_df, grid_tiered, summary
 
 
 if __name__ == "__main__":
-    df, jmi_df, grid_tiered, summary = main()
+    df, pair_df, grid_tiered, summary = main()

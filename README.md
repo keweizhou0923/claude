@@ -13,19 +13,22 @@ A synthetic portfolio of **50,000 accounts** with a **~25% charge-off rate**. Fi
 ### Step 1 — Individual Model Benchmarking
 Each model is assessed independently using its **Lorenz curve** and **Gini coefficient** (ROC-based: `2 × AUC − 1`). This establishes a standalone performance baseline but does not determine which pair to use together.
 
-### Step 2 — Pair Selection via Conditional Mutual Information (CMI)
-Rather than combining models with logistic regression and measuring the blended AUC, we measure how much **new information** each candidate second model adds given the first is already known:
+### Step 2 — Pair Selection: CMI ranked, JMI as reference
 
-```
-CMI = [ I(Y ; B | A) + I(Y ; A | B) ] / 2
-    = H(Y|A) − H(Y|A,B)   averaged symmetrically
-```
+Both metrics are computed in a single 5-fold CV loop and reported side-by-side. **Pairs are ranked by CMI.**
 
-CMI is **model-free** — it measures information overlap directly from the data, without assuming a linear or any other functional relationship between the two scores. A pair of individually strong models that carry identical information about charge-off will score near zero; a weaker model that sees different risk signals scores higher.
+| Metric | Formula | Measures |
+|---|---|---|
+| **CMI** *(ranking)* | `[I(Y;B\|A) + I(Y;A\|B)] / 2` | Complementarity — new information each model adds beyond the other |
+| **JMI** *(diagnostic)* | `H(Y) − H(Y\|A,B)` | Total combined information the pair carries about charge-off |
 
-**Cross-validation** (5-fold) ensures CMI is estimated on held-out data — bin boundaries are fit on the training fold and applied to the test fold only.
+**Why rank by CMI?** JMI is dominated by the stronger individual model — a pair where one model is very strong and the other is irrelevant can outscore a pair of two genuinely complementary moderate models. CMI removes this bias by measuring only the *incremental* contribution of each model given the other is already known.
 
-**Winner: Model_A + Model_E** (CMI = 0.084 bits), despite Model_E ranking last individually (Gini = 0.106). Model_A + Model_B, both individually strong, ranked last on CMI (0.016 bits) because they are largely redundant.
+**Why show JMI?** JMI reveals the pair's absolute ceiling of discrimination. A pair with high CMI but low JMI is complementary but both models are weak. High JMI alongside low CMI signals a pair where both models are strong but largely redundant.
+
+**Cross-validation** (5-fold) ensures both metrics are estimated on held-out data — bin boundaries are fit on the training fold and applied to the test fold only.
+
+**Winner: Model_A + Model_E** (CMI = 0.084 bits). Model_A + Model_B ranks last on CMI (0.016 bits) — both are strong individually (high JMI) but largely redundant with each other.
 
 ### Step 3 — Score Grid Construction
 The best pair is used to build a **5 × 5 score grid**: each model score is independently split into five equal-population quintile tiers (Tier 1 = safest/highest score, Tier 5 = riskiest/lowest score), producing 25 cells. Each cell reports account volume, charge-off count, and charge-off rate.
@@ -52,9 +55,9 @@ CO rates are **accounts-weighted averages** across all cells in a tier.
 | File | Description |
 |---|---|
 | `lorenz_curves.png` | Lorenz curves for all 5 models with Gini coefficients |
-| `cmi_table.png` | Ranked CMI table for all 10 model pairs |
+| `pair_table.png` | Pair ranking table — CMI and JMI side-by-side, ranked by CMI |
 | `score_grid_chart.png` | Coloured 5×5 grid with volume, CO count, CO%, tier colours, and CO rate cut points |
-| `pair_cmi_rankings.csv` | Raw CMI scores for all pairs |
+| `pair_rankings.csv` | Raw CMI and JMI scores for all pairs |
 | `score_grid_raw.csv` | 25-cell grid with CO rates |
 | `score_grid_tiered.csv` | Grid with risk tier labels assigned |
 | `risk_tier_summary.csv` | Tier-level summary with CO rates, multipliers, and coverage |
