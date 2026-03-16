@@ -134,11 +134,10 @@ def _compute_ginis(df: pd.DataFrame) -> dict:
 
 
 def plot_lorenz_by_best_model_bins(df: pd.DataFrame) -> None:
-    """Lorenz curves for each non-best model, sliced by the best model's quintile bins."""
+    """5 charts (one per best-model quintile bin), each overlaying all other models."""
     ginis = _compute_ginis(df)
     best_model   = max(ginis, key=lambda m: ginis[m])
     other_models = [m for m in MODELS if m != best_model]
-    n_other      = len(other_models)
 
     print(f"    Best individual model : {best_model}  (Gini = {ginis[best_model]:.3f})")
 
@@ -148,82 +147,60 @@ def plot_lorenz_by_best_model_bins(df: pd.DataFrame) -> None:
         base[best_model], q=N_BINS, labels=False, retbins=True, duplicates="drop"
     )
 
-    row_colors = ["#2c7bb6", "#d7191c", "#1a9641", "#9e4fb5"]
+    line_styles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+    colors      = ["#2c7bb6", "#d7191c", "#1a9641", "#9e4fb5"]
 
-    fig, axes = plt.subplots(
-        n_other, N_BINS,
-        figsize=(N_BINS * 3.0, n_other * 2.8),
-        squeeze=False,
-    )
+    fig, axes = plt.subplots(1, N_BINS, figsize=(N_BINS * 3.8, 4.2), squeeze=False)
 
-    for row_i, other in enumerate(other_models):
-        color = row_colors[row_i % len(row_colors)]
+    for bin_i in range(N_BINS):
+        ax   = axes[0][bin_i]
+        lo_s = f"{int(cuts[bin_i])}"
+        hi_s = f"{int(cuts[bin_i + 1])}"
+        bin_mask = base["_bin"] == bin_i
 
-        for bin_i in range(N_BINS):
-            ax  = axes[row_i][bin_i]
-            sub = base.loc[base["_bin"] == bin_i, ["charge_off", other]].dropna()
+        # Random-model diagonal
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.9, alpha=0.5, label="Random")
 
-            # Score range label for column header
-            lo_s = f"{int(cuts[bin_i])}"
-            hi_s = f"{int(cuts[bin_i + 1])}"
-
-            # Random-model diagonal
-            ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5)
-
+        for m_i, other in enumerate(other_models):
+            sub = base.loc[bin_mask, ["charge_off", other]].dropna()
             enough = (
                 len(sub) >= 5
                 and sub["charge_off"].sum() > 0
                 and sub["charge_off"].sum() < len(sub)
             )
             if not enough:
-                ax.text(0.5, 0.5, "Insufficient\ndata",
-                        ha="center", va="center", fontsize=7,
-                        transform=ax.transAxes, color="#888888")
-            else:
-                sub_s     = sub.sort_values(other, ascending=True).reset_index(drop=True)
-                cum_accts = np.arange(1, len(sub_s) + 1) / len(sub_s)
-                cum_co    = sub_s["charge_off"].cumsum() / sub_s["charge_off"].sum()
-                gini      = round(2 * roc_auc_score(sub_s["charge_off"], -sub_s[other]) - 1, 3)
+                continue
 
-                ax.plot(cum_accts, cum_co, color=color, linewidth=1.5)
-                ax.fill_between(cum_accts, cum_accts, cum_co, alpha=0.12, color=color)
+            sub_s     = sub.sort_values(other, ascending=True).reset_index(drop=True)
+            cum_accts = np.arange(1, len(sub_s) + 1) / len(sub_s)
+            cum_co    = sub_s["charge_off"].cumsum() / sub_s["charge_off"].sum()
+            gini      = round(2 * roc_auc_score(sub_s["charge_off"], -sub_s[other]) - 1, 3)
 
-                ax.text(0.05, 0.91, f"Gini = {gini:.3f}",
-                        transform=ax.transAxes, fontsize=7.5,
-                        fontweight="bold", color=color,
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
-                ax.text(0.05, 0.77, f"N = {len(sub_s):,}",
-                        transform=ax.transAxes, fontsize=6.5, color="#555555")
+            ax.plot(cum_accts, cum_co,
+                    color=colors[m_i % len(colors)],
+                    linestyle=line_styles[m_i % len(line_styles)],
+                    linewidth=1.6,
+                    label=f"{other}  (Gini={gini:.3f})")
 
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1)
-            ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
-            ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
-            ax.tick_params(labelsize=6)
-            ax.grid(True, alpha=0.2, linestyle="--")
-
-            # Column header: bin score range (top row only)
-            if row_i == 0:
-                ax.set_title(
-                    f"Bin {bin_i + 1}  [{lo_s}–{hi_s}]\n{best_model} quintile",
-                    fontsize=7.5, fontweight="bold",
-                )
-
-            # Row label: other model + overall Gini (leftmost col only)
-            if bin_i == 0:
-                ax.set_ylabel(
-                    f"{other}\n(overall Gini={ginis[other]:.3f})\n\nCum. % COs",
-                    fontsize=7.5,
-                )
-
-            # X-axis label (bottom row only)
-            if row_i == n_other - 1:
-                ax.set_xlabel("Cum. % Accounts", fontsize=7)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.25, linestyle="--")
+        ax.set_title(
+            f"Bin {bin_i + 1}  [{lo_s}–{hi_s}]\n({best_model} quintile)",
+            fontsize=8.5, fontweight="bold",
+        )
+        ax.set_xlabel("Cum. % Accounts", fontsize=8)
+        if bin_i == 0:
+            ax.set_ylabel("Cum. % Charge-Offs Captured", fontsize=8)
+        ax.legend(fontsize=6.5, loc="lower right")
 
     fig.suptitle(
         f"Lorenz Curves by {best_model} Score Bin  (best individual model, Gini = {ginis[best_model]:.3f})\n"
-        f"Each subplot: discriminative power of the row model within that {best_model} quintile",
-        fontsize=11, fontweight="bold", y=1.01,
+        f"Each chart: all other models' Lorenz curves within that {best_model} quintile",
+        fontsize=11, fontweight="bold",
     )
     plt.tight_layout()
     plt.savefig("lorenz_by_best_model_bins.png", bbox_inches="tight")
