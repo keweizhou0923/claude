@@ -117,7 +117,122 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. PAIR METRIC FUNCTIONS
+# 3. LORENZ CURVES — per-bin, conditioned on the best individual model
+#    Layout: (N-1) rows  ×  N_BINS cols
+#      rows  = each non-best model
+#      cols  = score quintile of the best model (Bin 1 = lowest/riskiest score)
+#    Within each cell: Lorenz curve of the other model restricted to that bin.
+# ──────────────────────────────────────────────────────────────────────────────
+def _compute_ginis(df: pd.DataFrame) -> dict:
+    return {
+        m: round(2 * roc_auc_score(
+            df[["charge_off", m]].dropna()["charge_off"],
+            -df[["charge_off", m]].dropna()[m],
+        ) - 1, 3)
+        for m in MODELS
+    }
+
+
+def plot_lorenz_by_best_model_bins(df: pd.DataFrame) -> None:
+    """Lorenz curves for each non-best model, sliced by the best model's quintile bins."""
+    ginis = _compute_ginis(df)
+    best_model   = max(ginis, key=lambda m: ginis[m])
+    other_models = [m for m in MODELS if m != best_model]
+    n_other      = len(other_models)
+
+    print(f"    Best individual model : {best_model}  (Gini = {ginis[best_model]:.3f})")
+
+    # Bin by best model's quintiles (bin 0 = lowest score = riskiest)
+    base = df[["charge_off", best_model] + other_models].dropna(subset=[best_model]).copy()
+    base["_bin"], cuts = pd.qcut(
+        base[best_model], q=N_BINS, labels=False, retbins=True, duplicates="drop"
+    )
+
+    row_colors = ["#2c7bb6", "#d7191c", "#1a9641", "#9e4fb5"]
+
+    fig, axes = plt.subplots(
+        n_other, N_BINS,
+        figsize=(N_BINS * 3.0, n_other * 2.8),
+        squeeze=False,
+    )
+
+    for row_i, other in enumerate(other_models):
+        color = row_colors[row_i % len(row_colors)]
+
+        for bin_i in range(N_BINS):
+            ax  = axes[row_i][bin_i]
+            sub = base.loc[base["_bin"] == bin_i, ["charge_off", other]].dropna()
+
+            # Score range label for column header
+            lo_s = f"{int(cuts[bin_i])}"
+            hi_s = f"{int(cuts[bin_i + 1])}"
+
+            # Random-model diagonal
+            ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5)
+
+            enough = (
+                len(sub) >= 5
+                and sub["charge_off"].sum() > 0
+                and sub["charge_off"].sum() < len(sub)
+            )
+            if not enough:
+                ax.text(0.5, 0.5, "Insufficient\ndata",
+                        ha="center", va="center", fontsize=7,
+                        transform=ax.transAxes, color="#888888")
+            else:
+                sub_s     = sub.sort_values(other, ascending=True).reset_index(drop=True)
+                cum_accts = np.arange(1, len(sub_s) + 1) / len(sub_s)
+                cum_co    = sub_s["charge_off"].cumsum() / sub_s["charge_off"].sum()
+                gini      = round(2 * roc_auc_score(sub_s["charge_off"], -sub_s[other]) - 1, 3)
+
+                ax.plot(cum_accts, cum_co, color=color, linewidth=1.5)
+                ax.fill_between(cum_accts, cum_accts, cum_co, alpha=0.12, color=color)
+
+                ax.text(0.05, 0.91, f"Gini = {gini:.3f}",
+                        transform=ax.transAxes, fontsize=7.5,
+                        fontweight="bold", color=color,
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+                ax.text(0.05, 0.77, f"N = {len(sub_s):,}",
+                        transform=ax.transAxes, fontsize=6.5, color="#555555")
+
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.xaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+            ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+            ax.tick_params(labelsize=6)
+            ax.grid(True, alpha=0.2, linestyle="--")
+
+            # Column header: bin score range (top row only)
+            if row_i == 0:
+                ax.set_title(
+                    f"Bin {bin_i + 1}  [{lo_s}–{hi_s}]\n{best_model} quintile",
+                    fontsize=7.5, fontweight="bold",
+                )
+
+            # Row label: other model + overall Gini (leftmost col only)
+            if bin_i == 0:
+                ax.set_ylabel(
+                    f"{other}\n(overall Gini={ginis[other]:.3f})\n\nCum. % COs",
+                    fontsize=7.5,
+                )
+
+            # X-axis label (bottom row only)
+            if row_i == n_other - 1:
+                ax.set_xlabel("Cum. % Accounts", fontsize=7)
+
+    fig.suptitle(
+        f"Lorenz Curves by {best_model} Score Bin  (best individual model, Gini = {ginis[best_model]:.3f})\n"
+        f"Each subplot: discriminative power of the row model within that {best_model} quintile",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout()
+    plt.savefig("lorenz_by_best_model_bins.png", bbox_inches="tight")
+    plt.close()
+    print("    Saved: lorenz_by_best_model_bins.png")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. PAIR METRIC FUNCTIONS
 #    Two complementary metrics computed in a single CV loop:
 #
 #    JMI  (selection criterion — total combined power)
@@ -185,7 +300,7 @@ def compute_pair_metrics_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. PAIR TABLE  —  both metrics shown; rows sorted by JMI (selection criterion)
+# 5. PAIR TABLE  —  both metrics shown; rows sorted by JMI (selection criterion)
 #    Each pair carries both a JMI rank and a CMI rank so the contrast is visible
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_pair_table(pair_df: pd.DataFrame) -> None:
@@ -240,7 +355,7 @@ def plot_pair_table(pair_df: pd.DataFrame) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. SCORE GRID  —  5 × 5 quintile bins; returns grid + cut points
+# 6. SCORE GRID  —  5 × 5 quintile bins; returns grid + cut points
 # ──────────────────────────────────────────────────────────────────────────────
 def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5):
     sub    = df[[m1, m2, "charge_off"]].dropna().copy()
@@ -261,7 +376,7 @@ def build_score_grid(df: pd.DataFrame, m1: str, m2: str, n_buckets: int = 5):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. TIER ASSIGNMENT  —  exhaustive search, 1.5x weighted-average CO rule
+# 7. TIER ASSIGNMENT  —  exhaustive search, 1.5x weighted-average CO rule
 # ──────────────────────────────────────────────────────────────────────────────
 def _weighted_co(cells: pd.DataFrame) -> float:
     total_n = cells["N"].sum()
@@ -336,7 +451,7 @@ def assign_tiers(grid: pd.DataFrame, n_tiers: int = N_TIERS,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. SCORE GRID CHART
+# 8. SCORE GRID CHART
 #    Coloured 5×5 heatmap — each cell annotated with N / #CO / CO%
 #    Axes labelled with actual score cut points
 #    Right panel shows CO-rate cut points per risk tier
@@ -477,7 +592,7 @@ def plot_score_grid(grid_tiered: pd.DataFrame, m1: str, m2: str,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. MAIN PIPELINE
+# 9. MAIN PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
     sep = "=" * 70
@@ -491,11 +606,14 @@ def main():
     print(f"    Actual Charge-Off Rate : {df['charge_off'].mean():.2%}")
 
     # ── Lorenz curves ──────────────────────────────────────────────────────────
-    print("\n[2] Lorenz Curves")
+    print("\n[2] Lorenz Curves — all models")
     plot_lorenz_curves(df)
 
+    print("\n[3] Lorenz Curves — per bin of best individual model")
+    plot_lorenz_by_best_model_bins(df)
+
     # ── pair selection: CMI + JMI ─────────────────────────────────────────────
-    print(f"\n[3] Pair Selection — CMI & JMI ({N_FOLDS}-fold CV, selected by JMI)")
+    print(f"\n[4] Pair Selection — CMI & JMI ({N_FOLDS}-fold CV, selected by JMI)")
     print("-" * 70)
     pair_rows = [compute_pair_metrics_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
     pair_df   = (pd.DataFrame(pair_rows)
@@ -515,7 +633,7 @@ def main():
     print(f"     CMI mean   = {best['CMI_mean']:.6f} bits  (complementarity, CMI rank #{best['CMI_Rank']})")
 
     # ── score grid ────────────────────────────────────────────────────────────
-    print(f"\n[4] Building 5×5 Score Grid — {best['Pair']}")
+    print(f"\n[5] Building 5×5 Score Grid — {best['Pair']}")
     grid, cuts_m1, cuts_m2 = build_score_grid(df, best_m1, best_m2)
     grid.to_csv("score_grid_raw.csv", index=False)
 
@@ -527,7 +645,7 @@ def main():
     print(pivot_co.round(3).to_string())
 
     # ── tier assignment ───────────────────────────────────────────────────────
-    print(f"\n[5] Tier Assignment — {MULT}x CO Rate Rule")
+    print(f"\n[6] Tier Assignment — {MULT}x CO Rate Rule")
     print("-" * 70)
     grid_tiered, summary, co_cuts = assign_tiers(grid)
     grid_tiered.to_csv("score_grid_tiered.csv", index=False)
@@ -549,13 +667,14 @@ def main():
               f"{rates[i-1]:.1%} → {rates[i]:.1%}  ({ratio:.2f}x)  {status}")
 
     # ── score grid chart ───────────────────────────────────────────────────────
-    print(f"\n[6] Score Grid Chart")
+    print(f"\n[7] Score Grid Chart")
     plot_score_grid(grid_tiered, best_m1, best_m2,
                     cuts_m1, cuts_m2, summary, co_cuts)
 
     # ── output summary ─────────────────────────────────────────────────────────
-    print("\n[7] Files written:")
-    for f in ["lorenz_curves.png", "pair_table.png",
+    print("\n[8] Files written:")
+    for f in ["lorenz_curves.png", "lorenz_by_best_model_bins.png",
+              "pair_table.png",
               "pair_rankings.csv", "score_grid_raw.csv",
               "score_grid_tiered.csv", "risk_tier_summary.csv",
               "score_grid_chart.png"]:
