@@ -118,7 +118,10 @@ def plot_lorenz_curves(df: pd.DataFrame) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. CMI FUNCTIONS  (unchanged from v1)
+# 3. JMI FUNCTIONS
+#    Joint Mutual Information  I(Y ; A, B) = H(Y) − H(Y | A, B)
+#    Symmetric by construction — no primary/secondary model ordering.
+#    Rewards pairs where BOTH models are individually strong AND complementary.
 # ──────────────────────────────────────────────────────────────────────────────
 def _h(p: float) -> float:
     if p <= 0.0 or p >= 1.0:
@@ -133,13 +136,6 @@ def _make_cuts(scores, n_bins):
 def _apply_cuts(scores, cuts):
     return np.array(pd.cut(scores, bins=cuts, labels=False), dtype=float)
 
-def _h_y_given_a(y, a_bins):
-    n, h = len(y), 0.0
-    for av in np.unique(a_bins[~np.isnan(a_bins)]):
-        m = a_bins == av
-        h += m.sum() / n * _h(y[m].mean())
-    return h
-
 def _h_y_given_ab(y, a_bins, b_bins):
     n = len(y)
     dt = pd.DataFrame({"y": y, "a": a_bins, "b": b_bins}).dropna()
@@ -148,37 +144,37 @@ def _h_y_given_ab(y, a_bins, b_bins):
         h += len(grp) / n * _h(grp["y"].mean())
     return h
 
-def _cmi_dir(y, pb, sb):
-    return max(0.0, _h_y_given_a(y, pb) - _h_y_given_ab(y, pb, sb))
-
-def compute_cmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
+def compute_jmi_cv(df: pd.DataFrame, m1: str, m2: str) -> dict:
+    """I(Y; A, B) = H(Y) - H(Y|A,B) with k-fold CV.  Bins fit on train fold only."""
     sub = df[[m1, m2, "charge_off"]].dropna().reset_index(drop=True)
     y, sa, sb = sub["charge_off"].values, sub[m1].values, sub[m2].values
     kf, vals = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42), []
     for tr, te in kf.split(y):
         ca, cb = _make_cuts(sa[tr], N_BINS), _make_cuts(sb[tr], N_BINS)
         ab, bb = _apply_cuts(sa[te], ca), _apply_cuts(sb[te], cb)
-        vals.append((_cmi_dir(y[te], ab, bb) + _cmi_dir(y[te], bb, ab)) / 2)
+        h_y    = _h(y[te].mean())               # H(Y) on test fold
+        h_y_ab = _h_y_given_ab(y[te], ab, bb)   # H(Y|A,B) on test fold
+        vals.append(max(0.0, h_y - h_y_ab))
     return {
         "Pair":     f"{m1} + {m2}",
         "N_valid":  len(sub),
-        "CMI_mean": round(np.mean(vals), 6),
-        "CMI_std":  round(np.std(vals),  6),
-        "CMI_min":  round(np.min(vals),  6),
+        "JMI_mean": round(np.mean(vals), 6),
+        "JMI_std":  round(np.std(vals),  6),
+        "JMI_min":  round(np.min(vals),  6),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. CMI TABLE  —  matplotlib figure of the ranked pair table
+# 4. JMI TABLE  —  matplotlib figure of the ranked pair table
 # ──────────────────────────────────────────────────────────────────────────────
-def plot_cmi_table(cmi_df: pd.DataFrame) -> None:
+def plot_jmi_table(jmi_df: pd.DataFrame) -> None:
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.axis("off")
 
-    display = cmi_df[["Pair", "N_valid", "CMI_mean", "CMI_std", "CMI_min"]].copy()
-    display.columns = ["Model Pair", "N Valid", "CMI Mean (bits)", "CMI Std", "CMI Min (bits)"]
+    display = jmi_df[["Pair", "N_valid", "JMI_mean", "JMI_std", "JMI_min"]].copy()
+    display.columns = ["Model Pair", "N Valid", "JMI Mean (bits)", "JMI Std", "JMI Min (bits)"]
     display["Rank"] = range(1, len(display) + 1)
-    display = display[["Rank", "Model Pair", "N Valid", "CMI Mean (bits)", "CMI Std", "CMI Min (bits)"]]
+    display = display[["Rank", "Model Pair", "N Valid", "JMI Mean (bits)", "JMI Std", "JMI Min (bits)"]]
 
     tbl = ax.table(
         cellText=display.values,
@@ -206,12 +202,12 @@ def plot_cmi_table(cmi_df: pd.DataFrame) -> None:
         for j in range(len(display.columns)):
             tbl[i, j].set_facecolor(clr)
 
-    ax.set_title("CMI Pair Ranking  (5-fold CV · Symmetric · sorted by CMI Mean)",
+    ax.set_title("JMI Pair Ranking  (5-fold CV · Symmetric · sorted by JMI Mean)",
                  fontsize=11, fontweight="bold", pad=12)
     plt.tight_layout()
-    plt.savefig("cmi_table.png", bbox_inches="tight")
+    plt.savefig("jmi_table.png", bbox_inches="tight")
     plt.close()
-    print("    Saved: cmi_table.png")
+    print("    Saved: jmi_table.png")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -471,23 +467,23 @@ def main():
     print("\n[2] Lorenz Curves")
     plot_lorenz_curves(df)
 
-    # ── CMI pair selection ────────────────────────────────────────────────────
-    print(f"\n[3] CMI Pair Selection ({N_FOLDS}-fold CV)")
+    # ── JMI pair selection ────────────────────────────────────────────────────
+    print(f"\n[3] JMI Pair Selection ({N_FOLDS}-fold CV)")
     print("-" * 70)
-    cmi_rows = [compute_cmi_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
-    cmi_df   = (pd.DataFrame(cmi_rows)
-                  .sort_values("CMI_mean", ascending=False)
+    jmi_rows = [compute_jmi_cv(df, m1, m2) for m1, m2 in combinations(MODELS, 2)]
+    jmi_df   = (pd.DataFrame(jmi_rows)
+                  .sort_values("JMI_mean", ascending=False)
                   .reset_index(drop=True))
 
-    print(cmi_df.to_string(index=False))
-    cmi_df.to_csv("pair_cmi_rankings.csv", index=False)
-    plot_cmi_table(cmi_df)
+    print(jmi_df.to_string(index=False))
+    jmi_df.to_csv("pair_jmi_rankings.csv", index=False)
+    plot_jmi_table(jmi_df)
 
-    best    = cmi_df.iloc[0]
+    best    = jmi_df.iloc[0]
     best_m1, best_m2 = [m.strip() for m in best["Pair"].split("+")]
     print(f"\n  ★  Best pair : {best['Pair']}")
-    print(f"     CMI mean   = {best['CMI_mean']:.6f} bits")
-    print(f"     CMI min    = {best['CMI_min']:.6f} bits")
+    print(f"     JMI mean   = {best['JMI_mean']:.6f} bits")
+    print(f"     JMI min    = {best['JMI_min']:.6f} bits")
 
     # ── score grid ────────────────────────────────────────────────────────────
     print(f"\n[4] Building 5×5 Score Grid — {best['Pair']}")
@@ -530,8 +526,8 @@ def main():
 
     # ── output summary ─────────────────────────────────────────────────────────
     print("\n[7] Files written:")
-    for f in ["lorenz_curves.png", "cmi_table.png",
-              "pair_cmi_rankings.csv", "score_grid_raw.csv",
+    for f in ["lorenz_curves.png", "jmi_table.png",
+              "pair_jmi_rankings.csv", "score_grid_raw.csv",
               "score_grid_tiered.csv", "risk_tier_summary.csv",
               "score_grid_chart.png"]:
         print(f"    {f}")
@@ -540,8 +536,8 @@ def main():
     print("  DONE")
     print(sep)
 
-    return df, cmi_df, grid_tiered, summary
+    return df, jmi_df, grid_tiered, summary
 
 
 if __name__ == "__main__":
-    df, cmi_df, grid_tiered, summary = main()
+    df, jmi_df, grid_tiered, summary = main()
